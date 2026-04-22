@@ -19,11 +19,11 @@ name = "serie"
 
 [[bin]]
 name = "lil-big-helper"
-path = "src/main.rs"
+path = "src/bin/lil-big-helper.rs"
 
 [[bin]]
 name = "lbh"
-path = "src/main.rs"
+path = "src/bin/lbh.rs"
 
 [dependencies]
 ansi-to-tui = "8.0.1"

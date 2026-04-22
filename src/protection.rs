@@ -9,10 +9,6 @@ const HOOK_FILE_NAME: &str = "pre-commit";
 const MANAGED_START: &str = "# lil-big-helper managed start";
 const MANAGED_END: &str = "# lil-big-helper managed end";
 
-pub fn is_protected_branch(branch: &str, config: &GitHelperConfig) -> bool {
-    config.protected_base_branches.iter().any(|b| b == branch)
-}
-
 pub fn install_or_update_pre_commit_hook(git_dir: &Path, config: &GitHelperConfig) -> Result<()> {
     let hook_path = git_dir.join("hooks").join(HOOK_FILE_NAME);
     let content = managed_hook_content(config);
@@ -101,8 +97,10 @@ mod tests {
 
     #[test]
     fn protected_branch_match() {
-        assert!(is_protected_branch("main", &config()));
-        assert!(!is_protected_branch("feature/test", &config()));
+        let content = managed_hook_content(&config());
+        assert!(content.contains("\"main\""));
+        assert!(content.contains("\"dev\""));
+        assert!(!content.contains("\"feature/test\""));
     }
 
     #[test]
