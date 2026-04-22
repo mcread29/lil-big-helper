@@ -110,6 +110,9 @@ impl<'a> UserCommandView<'a> {
             UserEvent::HelpToggle => {
                 self.tx.send(AppEvent::OpenHelp);
             }
+            UserEvent::OpenStatus => {
+                self.tx.send(AppEvent::OpenStatus);
+            }
             UserEvent::UserCommand(n) => {
                 if n == self.user_command_number {
                     self.tx.send(AppEvent::CloseUserCommand);

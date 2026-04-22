@@ -742,6 +742,10 @@ pub fn commit(path: &Path, message: &str) -> Result<()> {
     )
 }
 
+pub fn commit_staged_changes(path: &Path, message: &str) -> Result<()> {
+    commit(path, message)
+}
+
 pub fn push(path: &Path, remote: &str, branch: &str, set_upstream: bool) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("push");
@@ -805,6 +809,14 @@ pub enum FileChange {
     Modify { path: String },
     Delete { path: String },
     Move { from: String, to: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub path: String,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
 }
 
 pub fn get_diff_summary(path: &Path, commit_hash: &CommitHash) -> Vec<FileChange> {
@@ -878,4 +890,59 @@ pub fn get_initial_commit_additions(path: &Path, commit_hash: &CommitHash) -> Ve
     cmd.wait().unwrap();
 
     changes
+}
+
+pub fn get_status_entries(path: &Path) -> Vec<StatusEntry> {
+    git_lines(
+        Command::new("git")
+            .arg("status")
+            .arg("--short")
+            .arg("--untracked-files=all")
+            .current_dir(path),
+    )
+    .into_iter()
+    .filter_map(|line| parse_status_entry(&line))
+    .collect()
+}
+
+pub fn stage_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("add")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+pub fn unstage_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("restore")
+            .arg("--staged")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+fn parse_status_entry(line: &str) -> Option<StatusEntry> {
+    if line.len() < 4 {
+        return None;
+    }
+
+    let staged_code = line.chars().next()?;
+    let unstaged_code = line.chars().nth(1)?;
+    let raw_path = line[3..].trim();
+    let path = raw_path
+        .rsplit_once(" -> ")
+        .map(|(_, to)| to.to_string())
+        .unwrap_or_else(|| raw_path.to_string());
+
+    Some(StatusEntry {
+        path,
+        staged: staged_code != ' ' && staged_code != '?',
+        unstaged: unstaged_code != ' ' && unstaged_code != '?',
+        untracked: staged_code == '?' && unstaged_code == '?',
+    })
 }

@@ -109,6 +109,9 @@ impl<'a> DetailView<'a> {
             UserEvent::UserCommand(n) => {
                 self.tx.send(AppEvent::OpenUserCommand(n));
             }
+            UserEvent::OpenStatus => {
+                self.tx.send(AppEvent::OpenStatus);
+            }
             UserEvent::HelpToggle => {
                 self.tx.send(AppEvent::OpenHelp);
             }

@@ -45,6 +45,7 @@ enum PromptKind {
     CreateBranchBase,
     CreateBranchSuffix { base_branch: String },
     SwitchBranch,
+    StatusCommitMessage,
     SetBase,
     SetBranchPrefix,
 }
@@ -259,6 +260,17 @@ impl App<'_> {
                 AppEvent::OpenSetBranchPrefixPrompt => {
                     self.open_set_branch_prefix_prompt();
                 }
+                AppEvent::OpenStatus => {
+                    self.clear_image(Some(terminal))?;
+                    self.open_status();
+                }
+                AppEvent::CloseStatus => {
+                    terminal.clear()?;
+                    self.close_status();
+                }
+                AppEvent::OpenStatusCommitPrompt => {
+                    self.open_status_commit_prompt();
+                }
                 AppEvent::OpenDetail => {
                     self.clear_image(Some(terminal))?;
                     self.open_detail();
@@ -419,7 +431,8 @@ impl App<'_> {
     fn open_action_menu(&mut self) {
         self.open_prompt(
             PromptKind::ActionMenu,
-            "Action [b:create s:switch a:base f:prefix p:push m:merge i:hook r:refresh]".into(),
+            "Action [b:create s:switch t:status a:base f:prefix p:push m:merge i:hook r:refresh]"
+                .into(),
             None,
             None,
         );
@@ -506,6 +519,35 @@ impl App<'_> {
                 "Current: {current_prefix}. Default: {default_prefix}. Empty resets to default."
             )),
             Some(current_prefix),
+        );
+    }
+
+    fn open_status_commit_prompt(&mut self) {
+        if !matches!(self.view, View::Status(_)) {
+            return;
+        }
+        if let Some(branch) = git::get_current_branch(std::path::Path::new(".")) {
+            if self
+                .git_helper_config()
+                .protected_base_branches
+                .iter()
+                .any(|protected| protected == &branch)
+            {
+                self.error_notification(format!(
+                    "Direct commits to protected branch '{branch}' are blocked"
+                ));
+                return;
+            }
+        }
+        if !git::has_staged_changes(std::path::Path::new(".")) {
+            self.error_notification("No staged changes to commit".into());
+            return;
+        }
+        self.open_prompt(
+            PromptKind::StatusCommitMessage,
+            "Commit message".into(),
+            None,
+            None,
         );
     }
 
@@ -639,6 +681,11 @@ impl App<'_> {
                     self.error_notification(err);
                 }
             }
+            PromptKind::StatusCommitMessage => {
+                if let Err(err) = self.commit_staged_changes(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
             PromptKind::SetBase => {
                 if let Err(err) = self.set_current_branch_base(value.as_str()) {
                     self.error_notification(err);
@@ -656,6 +703,7 @@ impl App<'_> {
         match value.chars().next() {
             Some('b') => self.open_create_branch_prompt(),
             Some('s') => self.open_switch_branch_prompt(),
+            Some('t') => self.open_status(),
             Some('a') => self.open_set_base_prompt(),
             Some('f') => self.open_set_branch_prefix_prompt(),
             Some('p') => self.push_current_branch(),
@@ -803,6 +851,17 @@ impl App<'_> {
         Ok(())
     }
 
+    fn commit_staged_changes(&mut self, message: &str) -> Result<(), String> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("Commit message cannot be empty".into());
+        }
+        git::commit_staged_changes(std::path::Path::new("."), message)
+            .map_err(|err| err.to_string())?;
+        self.view.refresh();
+        Ok(())
+    }
+
     fn push_current_branch(&mut self) {
         let result = (|| -> Result<(), String> {
             let branch = git::get_current_branch(std::path::Path::new("."))
@@ -935,6 +994,25 @@ impl App<'_> {
 
     fn close_detail(&mut self) {
         if let View::Detail(ref mut view) = self.view {
+            let commit_list_state = view.take_list_state();
+            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+        }
+    }
+
+    fn open_status(&mut self) {
+        let commit_list_state = match self.view {
+            View::List(ref mut view) => view.take_list_state(),
+            View::Detail(ref mut view) => view.take_list_state(),
+            View::UserCommand(ref mut view) => view.take_list_state(),
+            View::Refs(ref mut view) => view.take_list_state(),
+            View::Status(_) | View::Help(_) | View::Default => return,
+        };
+        let entries = git::get_status_entries(std::path::Path::new("."));
+        self.view = View::of_status(commit_list_state, entries, self.ctx.clone(), self.ec.sender());
+    }
+
+    fn close_status(&mut self) {
+        if let View::Status(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
             self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
         }
@@ -1163,6 +1241,12 @@ impl App<'_> {
                 self.open_refs();
                 if let View::Refs(ref mut view) = self.view {
                     view.reset_refs_with(refs_context);
+                }
+            }
+            RefreshViewContext::Status { status_context, .. } => {
+                self.open_status();
+                if let View::Status(ref mut view) = self.view {
+                    view.reset_status_with(status_context);
                 }
             }
         }

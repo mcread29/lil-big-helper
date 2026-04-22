@@ -72,6 +72,9 @@ impl<'a> ListView<'a> {
                 UserEvent::SwitchBranch => {
                     self.tx.send(AppEvent::OpenSwitchBranchPrompt);
                 }
+                UserEvent::OpenStatus => {
+                    self.tx.send(AppEvent::OpenStatus);
+                }
                 UserEvent::PushCurrent => {
                     self.tx.send(AppEvent::PushCurrentBranch);
                 }

@@ -86,6 +86,9 @@ impl<'a> RefsView<'a> {
             UserEvent::ShortCopy | UserEvent::FullCopy => {
                 self.copy_ref_name();
             }
+            UserEvent::OpenStatus => {
+                self.tx.send(AppEvent::OpenStatus);
+            }
             UserEvent::HelpToggle => {
                 self.tx.send(AppEvent::OpenHelp);
             }
