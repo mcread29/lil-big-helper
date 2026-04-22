@@ -72,9 +72,6 @@ impl<'a> ListView<'a> {
                 UserEvent::SwitchBranch => {
                     self.tx.send(AppEvent::OpenSwitchBranchPrompt);
                 }
-                UserEvent::CommitCreate => {
-                    self.tx.send(AppEvent::OpenCommitPrompt);
-                }
                 UserEvent::PushCurrent => {
                     self.tx.send(AppEvent::PushCurrentBranch);
                 }
@@ -83,6 +80,12 @@ impl<'a> ListView<'a> {
                 }
                 UserEvent::InstallHook => {
                     self.tx.send(AppEvent::InstallHook);
+                }
+                UserEvent::SetBase => {
+                    self.tx.send(AppEvent::OpenSetBasePrompt);
+                }
+                UserEvent::SetBranchPrefix => {
+                    self.tx.send(AppEvent::OpenSetBranchPrefixPrompt);
                 }
                 UserEvent::NavigateDown | UserEvent::SelectDown => {
                     for _ in 0..count {

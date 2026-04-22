@@ -45,7 +45,8 @@ enum PromptKind {
     CreateBranchBase,
     CreateBranchSuffix { base_branch: String },
     SwitchBranch,
-    CommitMessage,
+    SetBase,
+    SetBranchPrefix,
 }
 
 #[derive(Debug)]
@@ -250,8 +251,11 @@ impl App<'_> {
                 AppEvent::OpenSwitchBranchPrompt => {
                     self.open_switch_branch_prompt();
                 }
-                AppEvent::OpenCommitPrompt => {
-                    self.open_commit_prompt();
+                AppEvent::OpenSetBasePrompt => {
+                    self.open_set_base_prompt();
+                }
+                AppEvent::OpenSetBranchPrefixPrompt => {
+                    self.open_set_branch_prefix_prompt();
                 }
                 AppEvent::OpenDetail => {
                     self.clear_image(Some(terminal))?;
@@ -413,7 +417,7 @@ impl App<'_> {
     fn open_action_menu(&mut self) {
         self.open_prompt(
             PromptKind::ActionMenu,
-            "Action [b:create s:switch c:commit p:push m:merge i:hook r:refresh]".into(),
+            "Action [b:create s:switch a:base f:prefix p:push m:merge i:hook r:refresh]".into(),
             None,
             None,
         );
@@ -421,9 +425,10 @@ impl App<'_> {
 
     fn open_create_branch_prompt(&mut self) {
         if let Some(base_branch) = self.infer_base_branch_for_create() {
+            let prefix = self.current_branch_prefix();
             self.open_prompt(
                 PromptKind::CreateBranchSuffix { base_branch },
-                format!("New branch suffix [{} / <name>]", self.git_helper_config().branch_prefix),
+                format!("New branch suffix [{} / <name>]", prefix),
                 None,
                 None,
             );
@@ -453,19 +458,40 @@ impl App<'_> {
         );
     }
 
-    fn open_commit_prompt(&mut self) {
-        match git::get_current_branch(std::path::Path::new(".")) {
-            Some(branch) if protection::is_protected_branch(&branch, self.git_helper_config()) => {
-                self.error_notification(format!(
-                    "Direct commits to protected branch '{branch}' are blocked"
-                ));
-            }
-            Some(_) if !git::has_staged_changes(std::path::Path::new(".")) => {
-                self.error_notification("No staged changes to commit".into());
-            }
-            Some(_) => self.open_prompt(PromptKind::CommitMessage, "Commit message".into(), None, None),
-            None => self.error_notification("Not on a branch".into()),
-        }
+    fn open_set_base_prompt(&mut self) {
+        let Some(branch) = git::get_current_branch(std::path::Path::new(".")) else {
+            self.error_notification("Not on a branch".into());
+            return;
+        };
+        let current_base = self
+            .load_repo_state()
+            .ok()
+            .and_then(|state| state.get_branch_origin(&branch).map(str::to_string))
+            .unwrap_or_else(|| "unset".into());
+        let protected = self.git_helper_config().protected_base_branches.join(", ");
+        self.open_prompt(
+            PromptKind::SetBase,
+            format!("Base branch for {branch}"),
+            Some(format!("Current: {current_base}. Options: {protected}")),
+            if current_base == "unset" {
+                None
+            } else {
+                Some(current_base)
+            },
+        );
+    }
+
+    fn open_set_branch_prefix_prompt(&mut self) {
+        let current_prefix = self.current_branch_prefix();
+        let default_prefix = self.git_helper_config().branch_prefix.as_str();
+        self.open_prompt(
+            PromptKind::SetBranchPrefix,
+            "Branch prefix".into(),
+            Some(format!(
+                "Current: {current_prefix}. Default: {default_prefix}. Empty resets to default."
+            )),
+            Some(current_prefix),
+        );
     }
 
     fn open_prompt(
@@ -541,10 +567,7 @@ impl App<'_> {
                 }
                 self.open_prompt(
                     PromptKind::CreateBranchSuffix { base_branch: value },
-                    format!(
-                        "New branch suffix [{} / <name>]",
-                        self.git_helper_config().branch_prefix
-                    ),
+                    format!("New branch suffix [{} / <name>]", self.current_branch_prefix()),
                     None,
                     None,
                 );
@@ -559,8 +582,13 @@ impl App<'_> {
                     self.error_notification(err);
                 }
             }
-            PromptKind::CommitMessage => {
-                if let Err(err) = self.commit_changes(value.as_str()) {
+            PromptKind::SetBase => {
+                if let Err(err) = self.set_current_branch_base(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+            PromptKind::SetBranchPrefix => {
+                if let Err(err) = self.set_branch_prefix_override(value.as_str()) {
                     self.error_notification(err);
                 }
             }
@@ -571,7 +599,8 @@ impl App<'_> {
         match value.chars().next() {
             Some('b') => self.open_create_branch_prompt(),
             Some('s') => self.open_switch_branch_prompt(),
-            Some('c') => self.open_commit_prompt(),
+            Some('a') => self.open_set_base_prompt(),
+            Some('f') => self.open_set_branch_prefix_prompt(),
             Some('p') => self.push_current_branch(),
             Some('m') => self.merge_base_into_current(),
             Some('i') => self.install_hook(),
@@ -583,6 +612,25 @@ impl App<'_> {
 
     fn git_helper_config(&self) -> &GitHelperConfig {
         &self.ctx.core_config.git_helper
+    }
+
+    fn load_repo_state(&self) -> Result<crate::repo_state::RepoState, String> {
+        let git_dir = git::get_git_dir(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+        load_repo_state(&git_dir).map_err(|err| err.to_string())
+    }
+
+    fn save_repo_state(&self, state: &crate::repo_state::RepoState) -> Result<(), String> {
+        let git_dir = git::get_git_dir(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+        save_repo_state(&git_dir, state).map_err(|err| err.to_string())
+    }
+
+    fn current_branch_prefix(&self) -> String {
+        self.load_repo_state()
+            .ok()
+            .and_then(|state| state.get_branch_prefix().map(str::to_string))
+            .unwrap_or_else(|| self.git_helper_config().branch_prefix.clone())
     }
 
     fn infer_base_branch_for_create(&self) -> Option<String> {
@@ -662,16 +710,14 @@ impl App<'_> {
 
         self.ensure_base_worktree(base_branch)?;
 
-        let branch_name = format!("{}/{}", self.git_helper_config().branch_prefix, suffix);
+        let branch_name = format!("{}/{}", self.current_branch_prefix(), suffix);
         git::create_branch(std::path::Path::new("."), &branch_name, base_branch)
             .map_err(|err| err.to_string())?;
         git::switch_branch(std::path::Path::new("."), &branch_name).map_err(|err| err.to_string())?;
 
-        let git_dir = git::get_git_dir(std::path::Path::new("."))
-            .ok_or_else(|| "Failed to resolve git dir".to_string())?;
-        let mut state = load_repo_state(&git_dir).map_err(|err| err.to_string())?;
+        let mut state = self.load_repo_state()?;
         state.set_branch_origin(&branch_name, base_branch);
-        save_repo_state(&git_dir, &state).map_err(|err| err.to_string())?;
+        self.save_repo_state(&state)?;
 
         self.view.refresh();
         Ok(())
@@ -696,16 +742,6 @@ impl App<'_> {
         }
 
         git::switch_branch(std::path::Path::new("."), branch).map_err(|err| err.to_string())?;
-        self.view.refresh();
-        Ok(())
-    }
-
-    fn commit_changes(&mut self, message: &str) -> Result<(), String> {
-        let message = message.trim();
-        if message.is_empty() {
-            return Err("Commit message cannot be empty".into());
-        }
-        git::commit(std::path::Path::new("."), message).map_err(|err| err.to_string())?;
         self.view.refresh();
         Ok(())
     }
@@ -735,9 +771,7 @@ impl App<'_> {
 
             let branch = git::get_current_branch(std::path::Path::new("."))
                 .ok_or_else(|| "Not on a branch".to_string())?;
-            let git_dir = git::get_git_dir(std::path::Path::new("."))
-                .ok_or_else(|| "Failed to resolve git dir".to_string())?;
-            let state = load_repo_state(&git_dir).map_err(|err| err.to_string())?;
+            let state = self.load_repo_state()?;
             let base_branch = state
                 .get_branch_origin(&branch)
                 .ok_or_else(|| format!("No base branch recorded for '{branch}'"))?
@@ -767,6 +801,47 @@ impl App<'_> {
             Ok(()) => self.success_notification("Installed lil-big-helper pre-commit hook".into()),
             Err(err) => self.error_notification(err),
         }
+    }
+
+    fn set_current_branch_base(&mut self, base_branch: &str) -> Result<(), String> {
+        let base_branch = base_branch.trim();
+        if !self
+            .git_helper_config()
+            .protected_base_branches
+            .iter()
+            .any(|branch| branch == base_branch)
+        {
+            return Err(format!("Unknown protected base branch '{base_branch}'"));
+        }
+
+        let current_branch = git::get_current_branch(std::path::Path::new("."))
+            .ok_or_else(|| "Not on a branch".to_string())?;
+        let mut state = self.load_repo_state()?;
+        state.set_branch_origin(&current_branch, base_branch);
+        self.save_repo_state(&state)?;
+        self.success_notification(format!(
+            "Base branch for '{current_branch}' set to '{base_branch}'"
+        ));
+        Ok(())
+    }
+
+    fn set_branch_prefix_override(&mut self, prefix: &str) -> Result<(), String> {
+        let prefix = prefix.trim().trim_matches('/');
+        let mut state = self.load_repo_state()?;
+        if prefix.is_empty() {
+            state.set_branch_prefix(None);
+            self.save_repo_state(&state)?;
+            self.success_notification(format!(
+                "Branch prefix reset to default '{}'",
+                self.git_helper_config().branch_prefix
+            ));
+            return Ok(());
+        }
+
+        state.set_branch_prefix(Some(prefix));
+        self.save_repo_state(&state)?;
+        self.success_notification(format!("Branch prefix set to '{prefix}'"));
+        Ok(())
     }
 
     fn update_state(&mut self, view_area: Rect) {

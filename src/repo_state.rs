@@ -15,6 +15,8 @@ const STATE_FILE_NAME: &str = "state.json";
 pub struct RepoState {
     #[serde(default)]
     pub branch_origins: FxHashMap<String, String>,
+    #[serde(default)]
+    pub branch_prefix: Option<String>,
 }
 
 impl RepoState {
@@ -24,6 +26,14 @@ impl RepoState {
 
     pub fn set_branch_origin(&mut self, branch: &str, base: &str) {
         self.branch_origins.insert(branch.into(), base.into());
+    }
+
+    pub fn get_branch_prefix(&self) -> Option<&str> {
+        self.branch_prefix.as_deref()
+    }
+
+    pub fn set_branch_prefix(&mut self, branch_prefix: Option<&str>) {
+        self.branch_prefix = branch_prefix.map(str::to_owned);
     }
 }
 
@@ -63,9 +73,24 @@ mod tests {
 
         let mut state = RepoState::default();
         state.set_branch_origin("feature/test", "dev");
+        state.set_branch_prefix(Some("feature/"));
         save_repo_state(git_dir, &state).unwrap();
 
         let loaded = load_repo_state(git_dir).unwrap();
         assert_eq!(loaded.get_branch_origin("feature/test"), Some("dev"));
+        assert_eq!(loaded.get_branch_prefix(), Some("feature/"));
+    }
+
+    #[test]
+    fn repo_state_defaults_branch_prefix_when_missing() {
+        let dir = tempdir().unwrap();
+        let git_dir = dir.path();
+        let path = state_file_path(git_dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "{\n  \"branch_origins\": {\n    \"feature/test\": \"dev\"\n  }\n}").unwrap();
+
+        let loaded = load_repo_state(git_dir).unwrap();
+        assert_eq!(loaded.get_branch_origin("feature/test"), Some("dev"));
+        assert_eq!(loaded.get_branch_prefix(), None);
     }
 }
