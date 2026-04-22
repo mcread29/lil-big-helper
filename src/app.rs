@@ -465,12 +465,16 @@ impl App<'_> {
             self.error_notification("Not on a branch".into());
             return;
         };
+        let selector_options = git::get_local_branches(std::path::Path::new("."));
+        if selector_options.is_empty() {
+            self.error_notification("No local branches available to select as a base".into());
+            return;
+        }
         let current_base = self
             .load_repo_state()
             .ok()
             .and_then(|state| state.get_branch_origin(&branch).map(str::to_string))
             .unwrap_or_else(|| "unset".into());
-        let selector_options = self.git_helper_config().protected_base_branches.clone();
         let selector_index = selector_options
             .iter()
             .position(|option| option == &current_base)
@@ -484,7 +488,7 @@ impl App<'_> {
             label: format!("Base branch for {branch}"),
             input,
             transient: Some(format!(
-                "Current: {current_base}. Use left/right or j/k, Enter to confirm."
+                "Current: {current_base}. Select any local branch with left/right or j/k."
             )),
             selector_options,
             selector_index,
@@ -858,13 +862,11 @@ impl App<'_> {
 
     fn set_current_branch_base(&mut self, base_branch: &str) -> Result<(), String> {
         let base_branch = base_branch.trim();
-        if !self
-            .git_helper_config()
-            .protected_base_branches
+        if !git::get_local_branches(std::path::Path::new("."))
             .iter()
             .any(|branch| branch == base_branch)
         {
-            return Err(format!("Unknown protected base branch '{base_branch}'"));
+            return Err(format!("Unknown local branch '{base_branch}'"));
         }
 
         let current_branch = git::get_current_branch(std::path::Path::new("."))
