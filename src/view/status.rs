@@ -1,4 +1,4 @@
-use std::{cmp::min, path::Path, rc::Rc};
+use std::{cmp::min, collections::BTreeMap, path::Path, rc::Rc};
 
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
@@ -37,6 +37,12 @@ impl Default for FocusArea {
 #[derive(Debug, Clone)]
 struct TreeRow {
     label: String,
+    entry_index: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct TreeNode {
+    children: BTreeMap<String, TreeNode>,
     entry_index: Option<usize>,
 }
 
@@ -239,7 +245,7 @@ impl<'a> StatusView<'a> {
             .enumerate()
             .skip(self.ui.file_offset)
             .take(visible_height)
-            .map(|(index, row)| {
+            .map(|(_, row)| {
                 let is_selected = row.entry_index == Some(self.selected);
                 let mut line = Line::raw(row.label.clone());
                 if is_selected {
@@ -250,24 +256,35 @@ impl<'a> StatusView<'a> {
                     line = line
                         .fg(self.ctx.color_theme.detail_label_fg)
                         .add_modifier(Modifier::BOLD);
-                } else if self.entries[self.selected.min(self.entries.len().saturating_sub(1))]
-                    .untracked
-                    && index == selected_row
-                {
-                    line = line.fg(self.ctx.color_theme.status_warn_fg);
+                } else if let Some(entry_index) = row.entry_index {
+                    line = line.fg(status_color(&self.entries[entry_index], &self.ctx));
+                    if entry_index == self.selected {
+                        line = line
+                            .fg(self.ctx.color_theme.ref_selected_fg)
+                            .bg(self.ctx.color_theme.ref_selected_bg);
+                    }
+                }
+                if is_selected && self.ui.focus == FocusArea::Files && !self.entries.is_empty() {
+                    line = line.add_modifier(Modifier::BOLD);
                 }
                 line
             })
             .collect::<Vec<_>>();
 
+        let selected_path = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.as_str())
+            .unwrap_or("clean");
         let title = format!(
-            "Changes [{}]{}",
+            "Changes [{}]{} {}",
             self.entries.len(),
             if self.ui.focus == FocusArea::Files {
                 " *"
             } else {
                 ""
-            }
+            },
+            selected_path
         );
         let paragraph = Paragraph::new(lines).block(
             Block::default()
@@ -484,50 +501,20 @@ impl<'a> StatusView<'a> {
     }
 
     fn rebuild_tree_rows(&mut self) {
-        let mut pairs = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (index, entry.path.clone()))
-            .collect::<Vec<_>>();
-        pairs.sort_by(|a, b| a.1.cmp(&b.1));
-
         self.tree_rows.clear();
-        let mut seen_dirs = Vec::<String>::new();
-        for (entry_index, path) in pairs {
-            let components = path.split('/').collect::<Vec<_>>();
-            let mut current = String::new();
-            for (depth, component) in components
-                .iter()
-                .enumerate()
-                .take(components.len().saturating_sub(1))
-            {
-                if !current.is_empty() {
-                    current.push('/');
-                }
-                current.push_str(component);
-                if seen_dirs.iter().any(|dir| dir == &current) {
-                    continue;
-                }
-                seen_dirs.push(current.clone());
-                self.tree_rows.push(TreeRow {
-                    label: format!(
-                        "{}{}{}/",
-                        "  ".repeat(depth),
-                        if depth > 0 { "└ " } else { "" },
-                        component
-                    ),
-                    entry_index: None,
-                });
-            }
-            let depth = components.len().saturating_sub(1);
-            let file_name = components.last().copied().unwrap_or(path.as_str());
-            let state = status_flags(&self.entries[entry_index]);
+        if self.entries.is_empty() {
             self.tree_rows.push(TreeRow {
-                label: format!("{}└ [{}] {}", "  ".repeat(depth), state, file_name),
-                entry_index: Some(entry_index),
+                label: "No changes".into(),
+                entry_index: None,
             });
+            return;
         }
+
+        let mut root = TreeNode::default();
+        for (entry_index, entry) in self.entries.iter().enumerate() {
+            insert_entry(&mut root, &entry.path, entry_index);
+        }
+        build_tree_rows(&mut self.tree_rows, &root, "", true, &self.entries);
     }
 
     fn refresh_diff(&mut self) {
@@ -575,6 +562,70 @@ fn status_flags(entry: &StatusEntry) -> &'static str {
         (true, false, false) => "S ",
         (false, true, false) => " M",
         _ => "  ",
+    }
+}
+
+fn status_color(entry: &StatusEntry, ctx: &AppContext) -> ratatui::style::Color {
+    if entry.untracked {
+        ctx.color_theme.status_warn_fg
+    } else if entry.staged && entry.unstaged {
+        ctx.color_theme.list_ref_tag_fg
+    } else if entry.staged {
+        ctx.color_theme.status_success_fg
+    } else {
+        ctx.color_theme.status_error_fg
+    }
+}
+
+fn insert_entry(root: &mut TreeNode, path: &str, entry_index: usize) {
+    let mut node = root;
+    for component in path.split('/') {
+        node = node.children.entry(component.to_string()).or_default();
+    }
+    node.entry_index = Some(entry_index);
+}
+
+fn build_tree_rows(
+    rows: &mut Vec<TreeRow>,
+    node: &TreeNode,
+    prefix: &str,
+    is_root: bool,
+    entries: &[StatusEntry],
+) {
+    let child_count = node.children.len();
+    for (position, (name, child)) in node.children.iter().enumerate() {
+        let is_last = position + 1 == child_count;
+        let connector = if is_root {
+            ""
+        } else if is_last {
+            "└─ "
+        } else {
+            "├─ "
+        };
+
+        if let Some(entry_index) = child.entry_index {
+            let state = status_flags(&entries[entry_index]);
+            rows.push(TreeRow {
+                label: format!("{prefix}{connector}[{state}] {name}"),
+                entry_index: Some(entry_index),
+            });
+        } else {
+            rows.push(TreeRow {
+                label: format!("{prefix}{connector}{name}/"),
+                entry_index: None,
+            });
+        }
+
+        if !child.children.is_empty() {
+            let next_prefix = if is_root {
+                String::new()
+            } else if is_last {
+                format!("{prefix}   ")
+            } else {
+                format!("{prefix}│  ")
+            };
+            build_tree_rows(rows, child, &next_prefix, false, entries);
+        }
     }
 }
 
