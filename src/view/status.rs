@@ -14,7 +14,6 @@ use crate::{
     app::AppContext,
     event::{AppEvent, Sender, UserEvent, UserEventWithCount},
     git::{self, StatusEntry},
-    repo_state::load_repo_state,
     view::{ListRefreshViewContext, RefreshViewContext, StatusRefreshViewContext},
     widget::commit_list::CommitListState,
 };
@@ -378,9 +377,6 @@ impl<'a> StatusView<'a> {
             Constraint::Length(3),
         ])
         .areas(area);
-        let current_branch =
-            git::get_current_branch(Path::new(".")).unwrap_or_else(|| "detached".into());
-        let (base_branch, prefix) = repo_status_metadata(&self.ctx);
 
         let button_label = if self.ui.focus == FocusArea::Button {
             "[ Commit ]"
@@ -388,15 +384,11 @@ impl<'a> StatusView<'a> {
             "Commit"
         };
 
-        let staged_count = self.entries.iter().filter(|entry| entry.staged).count();
-        let header = format!(
-            "Commit  branch:{current_branch}  base:{base_branch}  prefix:{prefix}  staged:{staged_count}  x discards"
-        );
         let title_focused = self.ui.focus == FocusArea::Title;
         let desc_focused = self.ui.focus == FocusArea::Description;
         self.ui.title.set_block(
             Block::default()
-                .title(header)
+                .title(if title_focused { "Title *" } else { "Title" })
                 .borders(Borders::ALL)
                 .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                 .padding(Padding::horizontal(1)),
@@ -414,13 +406,6 @@ impl<'a> StatusView<'a> {
         );
         f.render_widget(&self.ui.title, title_area);
         f.render_widget(&self.ui.description, desc_area);
-        f.render_widget(
-            Block::default()
-                .title(if title_focused { "Title *" } else { "Title" })
-                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-                .style(Style::default().fg(self.ctx.color_theme.divider_fg)),
-            title_area,
-        );
 
         let button_line = if self.ui.focus == FocusArea::Button {
             Line::raw(button_label)
@@ -631,27 +616,6 @@ impl<'a> StatusView<'a> {
     fn selected_row(&self) -> Option<&TreeRow> {
         self.tree_rows.get(self.selected_row)
     }
-}
-
-fn repo_status_metadata(ctx: &AppContext) -> (String, String) {
-    let default_prefix = ctx.core_config.git_helper.branch_prefix.clone();
-    let Some(git_dir) = git::get_git_dir(Path::new(".")) else {
-        return ("unset".into(), default_prefix);
-    };
-    let Ok(state) = load_repo_state(&git_dir) else {
-        return ("unset".into(), default_prefix);
-    };
-    let current_branch =
-        git::get_current_branch(Path::new(".")).unwrap_or_else(|| "detached".into());
-    let base = state
-        .get_branch_origin(&current_branch)
-        .unwrap_or("unset")
-        .to_string();
-    let prefix = state
-        .get_branch_prefix()
-        .map(str::to_string)
-        .unwrap_or(default_prefix);
-    (base, prefix)
 }
 
 fn status_flags(entry: &StatusEntry) -> &'static str {
