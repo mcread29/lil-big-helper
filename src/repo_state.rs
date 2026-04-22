@@ -87,7 +87,11 @@ mod tests {
         let git_dir = dir.path();
         let path = state_file_path(git_dir);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "{\n  \"branch_origins\": {\n    \"feature/test\": \"dev\"\n  }\n}").unwrap();
+        fs::write(
+            path,
+            "{\n  \"branch_origins\": {\n    \"feature/test\": \"dev\"\n  }\n}",
+        )
+        .unwrap();
 
         let loaded = load_repo_state(git_dir).unwrap();
         assert_eq!(loaded.get_branch_origin("feature/test"), Some("dev"));

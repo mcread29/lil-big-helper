@@ -21,8 +21,8 @@ use crate::{
     git::{self, Commit, FileChange, Head, Ref, Repository},
     graph::{CellWidthType, Graph, GraphImageManager},
     keybind::KeyBind,
-    protocol::ImageProtocol,
     protection,
+    protocol::ImageProtocol,
     repo_state::{load_repo_state, save_repo_state},
     view::{RefreshViewContext, View},
     widget::commit_list::{CommitInfo, CommitListState},
@@ -45,7 +45,6 @@ enum PromptKind {
     CreateBranchBase,
     CreateBranchSuffix { base_branch: String },
     SwitchBranch,
-    StatusCommitMessage,
     SetBase,
     SetBranchPrefix,
 }
@@ -267,9 +266,6 @@ impl App<'_> {
                 AppEvent::CloseStatus => {
                     terminal.clear()?;
                     self.close_status();
-                }
-                AppEvent::OpenStatusCommitPrompt => {
-                    self.open_status_commit_prompt();
                 }
                 AppEvent::OpenDetail => {
                     self.clear_image(Some(terminal))?;
@@ -522,35 +518,6 @@ impl App<'_> {
         );
     }
 
-    fn open_status_commit_prompt(&mut self) {
-        if !matches!(self.view, View::Status(_)) {
-            return;
-        }
-        if let Some(branch) = git::get_current_branch(std::path::Path::new(".")) {
-            if self
-                .git_helper_config()
-                .protected_base_branches
-                .iter()
-                .any(|protected| protected == &branch)
-            {
-                self.error_notification(format!(
-                    "Direct commits to protected branch '{branch}' are blocked"
-                ));
-                return;
-            }
-        }
-        if !git::has_staged_changes(std::path::Path::new(".")) {
-            self.error_notification("No staged changes to commit".into());
-            return;
-        }
-        self.open_prompt(
-            PromptKind::StatusCommitMessage,
-            "Commit message".into(),
-            None,
-            None,
-        );
-    }
-
     fn open_prompt(
         &mut self,
         kind: PromptKind,
@@ -612,7 +579,10 @@ impl App<'_> {
                             .handle_event(&ratatui::crossterm::event::Event::Key(key));
                     } else {
                         match key.code {
-                            KeyCode::Left | KeyCode::Up | KeyCode::BackTab | KeyCode::Char('h')
+                            KeyCode::Left
+                            | KeyCode::Up
+                            | KeyCode::BackTab
+                            | KeyCode::Char('h')
                             | KeyCode::Char('k') => {
                                 if prompt.selector_index == 0 {
                                     prompt.selector_index = prompt.selector_options.len() - 1;
@@ -666,7 +636,10 @@ impl App<'_> {
                 }
                 self.open_prompt(
                     PromptKind::CreateBranchSuffix { base_branch: value },
-                    format!("New branch suffix [{} / <name>]", self.current_branch_prefix()),
+                    format!(
+                        "New branch suffix [{} / <name>]",
+                        self.current_branch_prefix()
+                    ),
                     None,
                     None,
                 );
@@ -678,11 +651,6 @@ impl App<'_> {
             }
             PromptKind::SwitchBranch => {
                 if let Err(err) = self.switch_branch(value.as_str()) {
-                    self.error_notification(err);
-                }
-            }
-            PromptKind::StatusCommitMessage => {
-                if let Err(err) = self.commit_staged_changes(value.as_str()) {
                     self.error_notification(err);
                 }
             }
@@ -818,7 +786,8 @@ impl App<'_> {
         let branch_name = format!("{}/{}", self.current_branch_prefix(), suffix);
         git::create_branch(std::path::Path::new("."), &branch_name, base_branch)
             .map_err(|err| err.to_string())?;
-        git::switch_branch(std::path::Path::new("."), &branch_name).map_err(|err| err.to_string())?;
+        git::switch_branch(std::path::Path::new("."), &branch_name)
+            .map_err(|err| err.to_string())?;
 
         let mut state = self.load_repo_state()?;
         state.set_branch_origin(&branch_name, base_branch);
@@ -847,17 +816,6 @@ impl App<'_> {
         }
 
         git::switch_branch(std::path::Path::new("."), branch).map_err(|err| err.to_string())?;
-        self.view.refresh();
-        Ok(())
-    }
-
-    fn commit_staged_changes(&mut self, message: &str) -> Result<(), String> {
-        let message = message.trim();
-        if message.is_empty() {
-            return Err("Commit message cannot be empty".into());
-        }
-        git::commit_staged_changes(std::path::Path::new("."), message)
-            .map_err(|err| err.to_string())?;
         self.view.refresh();
         Ok(())
     }
@@ -1008,7 +966,12 @@ impl App<'_> {
             View::Status(_) | View::Help(_) | View::Default => return,
         };
         let entries = git::get_status_entries(std::path::Path::new("."));
-        self.view = View::of_status(commit_list_state, entries, self.ctx.clone(), self.ec.sender());
+        self.view = View::of_status(
+            commit_list_state,
+            entries,
+            self.ctx.clone(),
+            self.ec.sender(),
+        );
     }
 
     fn close_status(&mut self) {

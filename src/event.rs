@@ -27,7 +27,6 @@ pub enum AppEvent {
     OpenSetBranchPrefixPrompt,
     OpenStatus,
     CloseStatus,
-    OpenStatusCommitPrompt,
     OpenDetail,
     CloseDetail,
     OpenUserCommand(usize),

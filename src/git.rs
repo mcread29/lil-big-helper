@@ -905,6 +905,68 @@ pub fn get_status_entries(path: &Path) -> Vec<StatusEntry> {
     .collect()
 }
 
+pub fn get_status_diff(path: &Path, entry: &StatusEntry) -> Result<String> {
+    if entry.untracked {
+        return git_diff_output(
+            Command::new("git")
+                .arg("diff")
+                .arg("--no-index")
+                .arg("--color=never")
+                .arg("--")
+                .arg("/dev/null")
+                .arg(&entry.path)
+                .current_dir(path),
+            true,
+        );
+    }
+
+    let staged = if entry.staged {
+        Some(git_diff_output(
+            Command::new("git")
+                .arg("diff")
+                .arg("--cached")
+                .arg("--color=never")
+                .arg("--")
+                .arg(&entry.path)
+                .current_dir(path),
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    let unstaged = if entry.unstaged {
+        Some(git_diff_output(
+            Command::new("git")
+                .arg("diff")
+                .arg("--color=never")
+                .arg("--")
+                .arg(&entry.path)
+                .current_dir(path),
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    match (staged, unstaged) {
+        (Some(staged), Some(unstaged)) => {
+            let mut diff = String::new();
+            diff.push_str("--- staged ---\n");
+            diff.push_str(&staged);
+            if !staged.ends_with('\n') {
+                diff.push('\n');
+            }
+            diff.push_str("--- unstaged ---\n");
+            diff.push_str(&unstaged);
+            Ok(diff)
+        }
+        (Some(staged), None) => Ok(staged),
+        (None, Some(unstaged)) => Ok(unstaged),
+        (None, None) => Ok(String::new()),
+    }
+}
+
 pub fn stage_path(path: &Path, file_path: &str) -> Result<()> {
     run_git(
         Command::new("git")
@@ -945,4 +1007,21 @@ fn parse_status_entry(line: &str) -> Option<StatusEntry> {
         unstaged: unstaged_code != ' ' && unstaged_code != '?',
         untracked: staged_code == '?' && unstaged_code == '?',
     })
+}
+
+fn git_diff_output(cmd: &mut Command, allow_exit_code_one: bool) -> Result<String> {
+    let output = cmd.output()?;
+    if output.status.success() || (allow_exit_code_one && output.status.code() == Some(1)) {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+
+    if message.is_empty() {
+        Err("git command failed".into())
+    } else {
+        Err(message.into())
+    }
 }

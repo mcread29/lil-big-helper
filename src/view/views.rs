@@ -5,13 +5,13 @@ use ratatui::{crossterm::event::KeyEvent, layout::Rect, Frame};
 use crate::{
     app::AppContext,
     event::{Sender, UserEventWithCount},
+    git::StatusEntry,
     git::{Commit, FileChange, Ref},
     view::{
         detail::DetailView, help::HelpView, list::ListView, refs::RefsView, status::StatusView,
         user_command::UserCommandView,
     },
     widget::commit_list::CommitListState,
-    git::StatusEntry,
 };
 
 #[derive(Debug, Default)]
@@ -108,7 +108,12 @@ impl<'a> View<'a> {
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
-        View::Status(Box::new(StatusView::new(commit_list_state, entries, ctx, tx)))
+        View::Status(Box::new(StatusView::new(
+            commit_list_state,
+            entries,
+            ctx,
+            tx,
+        )))
     }
 
     pub fn of_help(before: View<'a>, ctx: Rc<AppContext>, tx: Sender) -> Self {
