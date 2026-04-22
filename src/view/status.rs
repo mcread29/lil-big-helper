@@ -396,10 +396,7 @@ impl<'a> StatusView<'a> {
         let desc_focused = self.ui.focus == FocusArea::Description;
         self.ui.title.set_block(
             Block::default()
-                .title(format!(
-                    "{header}  |  {}",
-                    if title_focused { "Title *" } else { "Title" }
-                ))
+                .title(header)
                 .borders(Borders::ALL)
                 .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                 .padding(Padding::horizontal(1)),
@@ -417,6 +414,13 @@ impl<'a> StatusView<'a> {
         );
         f.render_widget(&self.ui.title, title_area);
         f.render_widget(&self.ui.description, desc_area);
+        f.render_widget(
+            Block::default()
+                .title(if title_focused { "Title *" } else { "Title" })
+                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                .style(Style::default().fg(self.ctx.color_theme.divider_fg)),
+            title_area,
+        );
 
         let button_line = if self.ui.focus == FocusArea::Button {
             Line::raw(button_label)
