@@ -988,6 +988,30 @@ pub fn unstage_path(path: &Path, file_path: &str) -> Result<()> {
     )
 }
 
+pub fn discard_tracked_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("restore")
+            .arg("--source=HEAD")
+            .arg("--staged")
+            .arg("--worktree")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+pub fn discard_untracked_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("clean")
+            .arg("-fd")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
 fn parse_status_entry(line: &str) -> Option<StatusEntry> {
     if line.len() < 4 {
         return None;

@@ -36,8 +36,10 @@ impl Default for FocusArea {
 
 #[derive(Debug, Clone)]
 struct TreeRow {
+    path: String,
+    is_dir: bool,
     label: String,
-    entry_index: Option<usize>,
+    entry_indexes: Vec<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -60,7 +62,7 @@ pub struct StatusView<'a> {
     commit_list_state: Option<CommitListState<'a>>,
     entries: Vec<StatusEntry>,
     tree_rows: Vec<TreeRow>,
-    selected: usize,
+    selected_row: usize,
     diff_lines: Vec<String>,
     ui: StatusUiState,
     ctx: Rc<AppContext>,
@@ -78,7 +80,7 @@ impl<'a> StatusView<'a> {
             commit_list_state: Some(commit_list_state),
             entries,
             tree_rows: Vec::new(),
-            selected: 0,
+            selected_row: 0,
             diff_lines: Vec::new(),
             ui: StatusUiState {
                 focus: FocusArea::Files,
@@ -132,20 +134,23 @@ impl<'a> StatusView<'a> {
 
     pub fn reset_status_with(&mut self, ctx: StatusRefreshViewContext) {
         if self.entries.is_empty() {
-            self.selected = 0;
+            self.selected_row = 0;
             self.ui.file_offset = 0;
         } else {
-            self.selected = ctx.selected.min(self.entries.len().saturating_sub(1));
-            self.ui.file_offset = self.selected.saturating_sub(1);
+            self.selected_row = ctx.selected.min(self.tree_rows.len().saturating_sub(1));
+            self.ui.file_offset = self.selected_row.saturating_sub(1);
         }
         self.rebuild_tree_rows();
+        if self.selected_row >= self.tree_rows.len() {
+            self.selected_row = self.tree_rows.len().saturating_sub(1);
+        }
         self.refresh_diff();
     }
 
     pub fn refresh(&self) {
         let list_context = ListRefreshViewContext::from(self.as_list_state());
         let status_context = StatusRefreshViewContext {
-            selected: self.selected,
+            selected: self.selected_row,
         };
         self.tx.send(AppEvent::Refresh(RefreshViewContext::Status {
             list_context,
@@ -174,6 +179,7 @@ impl<'a> StatusView<'a> {
                 UserEvent::GoToTop => self.select_first(),
                 UserEvent::GoToBottom => self.select_last(),
                 UserEvent::Confirm | UserEvent::StatusToggle => self.toggle_selected(),
+                UserEvent::StatusDiscard => self.discard_selected(),
                 _ => {}
             },
             FocusArea::Diff => match event_with_count.event {
@@ -232,7 +238,9 @@ impl<'a> StatusView<'a> {
 
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
         let visible_height = area.height.saturating_sub(2) as usize;
-        let selected_row = self.row_index_for_selected();
+        let selected_row = self
+            .selected_row
+            .min(self.tree_rows.len().saturating_sub(1));
         if selected_row < self.ui.file_offset {
             self.ui.file_offset = selected_row;
         } else if selected_row >= self.ui.file_offset + visible_height && visible_height > 0 {
@@ -245,24 +253,23 @@ impl<'a> StatusView<'a> {
             .enumerate()
             .skip(self.ui.file_offset)
             .take(visible_height)
-            .map(|(_, row)| {
-                let is_selected = row.entry_index == Some(self.selected);
+            .map(|(index, row)| {
+                let is_selected = index == selected_row;
                 let mut line = Line::raw(row.label.clone());
                 if is_selected {
                     line = line
                         .fg(self.ctx.color_theme.ref_selected_fg)
                         .bg(self.ctx.color_theme.ref_selected_bg);
-                } else if row.entry_index.is_none() {
+                } else if row.is_dir {
                     line = line
                         .fg(self.ctx.color_theme.detail_label_fg)
                         .add_modifier(Modifier::BOLD);
-                } else if let Some(entry_index) = row.entry_index {
-                    line = line.fg(status_color(&self.entries[entry_index], &self.ctx));
-                    if entry_index == self.selected {
-                        line = line
-                            .fg(self.ctx.color_theme.ref_selected_fg)
-                            .bg(self.ctx.color_theme.ref_selected_bg);
-                    }
+                } else if !row.entry_indexes.is_empty() {
+                    line = line.fg(status_color_for_indexes(
+                        &row.entry_indexes,
+                        &self.entries,
+                        &self.ctx,
+                    ));
                 }
                 if is_selected && self.ui.focus == FocusArea::Files && !self.entries.is_empty() {
                     line = line.add_modifier(Modifier::BOLD);
@@ -272,12 +279,17 @@ impl<'a> StatusView<'a> {
             .collect::<Vec<_>>();
 
         let selected_path = self
-            .entries
-            .get(self.selected)
-            .map(|entry| entry.path.as_str())
+            .tree_rows
+            .get(selected_row)
+            .map(|row| row.path.as_str())
             .unwrap_or("clean");
+        let selected_count = self
+            .tree_rows
+            .get(selected_row)
+            .map(|row| row.entry_indexes.len())
+            .unwrap_or(0);
         let title = format!(
-            "Changes [{}]{} {}",
+            "Changes [{}]{} {} ({selected_count})",
             self.entries.len(),
             if self.ui.focus == FocusArea::Files {
                 " *"
@@ -366,7 +378,7 @@ impl<'a> StatusView<'a> {
 
         let staged_count = self.entries.iter().filter(|entry| entry.staged).count();
         let header = format!(
-            "Commit  branch:{current_branch}  base:{base_branch}  prefix:{prefix}  staged:{staged_count}"
+            "Commit  branch:{current_branch}  base:{base_branch}  prefix:{prefix}  staged:{staged_count}  x discards"
         );
         f.render_widget(
             Paragraph::new(Line::raw(title_label)).block(
@@ -406,54 +418,83 @@ impl<'a> StatusView<'a> {
         );
     }
 
-    fn row_index_for_selected(&self) -> usize {
-        self.tree_rows
-            .iter()
-            .position(|row| row.entry_index == Some(self.selected))
-            .unwrap_or(0)
-    }
-
     fn select_next(&mut self) {
-        if self.selected + 1 < self.entries.len() {
-            self.selected += 1;
+        if self.selected_row + 1 < self.tree_rows.len() {
+            self.selected_row += 1;
             self.refresh_diff();
         }
     }
 
     fn select_prev(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if self.selected_row > 0 {
+            self.selected_row -= 1;
             self.refresh_diff();
         }
     }
 
     fn select_first(&mut self) {
-        self.selected = 0;
+        self.selected_row = 0;
         self.refresh_diff();
     }
 
     fn select_last(&mut self) {
-        if !self.entries.is_empty() {
-            self.selected = self.entries.len() - 1;
+        if !self.tree_rows.is_empty() {
+            self.selected_row = self.tree_rows.len() - 1;
             self.refresh_diff();
         }
     }
 
     fn toggle_selected(&self) {
-        let Some(entry) = self.entries.get(self.selected) else {
+        let Some(row) = self.selected_row() else {
             return;
         };
-        let result = if entry.untracked || entry.unstaged {
-            git::stage_path(Path::new("."), &entry.path)
-        } else if entry.staged {
-            git::unstage_path(Path::new("."), &entry.path)
+        if row.entry_indexes.is_empty() {
+            return;
+        }
+        let should_stage = row
+            .entry_indexes
+            .iter()
+            .filter_map(|&index| self.entries.get(index))
+            .any(|entry| entry.untracked || entry.unstaged);
+        let result = if should_stage {
+            git::stage_path(Path::new("."), &row.path)
         } else {
-            Ok(())
+            git::unstage_path(Path::new("."), &row.path)
         };
 
         match result {
             Ok(()) => self.refresh(),
             Err(err) => self.tx.send(AppEvent::NotifyError(err.to_string())),
+        }
+    }
+
+    fn discard_selected(&self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.entry_indexes.is_empty() {
+            return;
+        }
+
+        let mut first_error = None;
+        for &index in &row.entry_indexes {
+            let Some(entry) = self.entries.get(index) else {
+                continue;
+            };
+            let result = if entry.untracked {
+                git::discard_untracked_path(Path::new("."), &entry.path)
+            } else {
+                git::discard_tracked_path(Path::new("."), &entry.path)
+            };
+            if let Err(err) = result {
+                first_error = Some(err.to_string());
+                break;
+            }
+        }
+
+        match first_error {
+            Some(err) => self.tx.send(AppEvent::NotifyError(err)),
+            None => self.refresh(),
         }
     }
 
@@ -504,8 +545,10 @@ impl<'a> StatusView<'a> {
         self.tree_rows.clear();
         if self.entries.is_empty() {
             self.tree_rows.push(TreeRow {
+                path: String::new(),
+                is_dir: false,
                 label: "No changes".into(),
-                entry_index: None,
+                entry_indexes: Vec::new(),
             });
             return;
         }
@@ -514,23 +557,49 @@ impl<'a> StatusView<'a> {
         for (entry_index, entry) in self.entries.iter().enumerate() {
             insert_entry(&mut root, &entry.path, entry_index);
         }
-        build_tree_rows(&mut self.tree_rows, &root, "", true, &self.entries);
+        build_tree_rows(&mut self.tree_rows, &root, "", "", true, &self.entries);
     }
 
     fn refresh_diff(&mut self) {
         self.ui.diff_offset = 0;
-        let Some(entry) = self.entries.get(self.selected) else {
-            self.diff_lines = vec!["No file selected".into()];
+        let Some(row) = self.selected_row() else {
+            self.diff_lines = vec!["No selection".into()];
             return;
         };
-        self.diff_lines = git::get_status_diff(Path::new("."), entry)
-            .unwrap_or_else(|err| format!("Failed to load diff: {err}"))
-            .lines()
-            .map(|line| line.to_string())
-            .collect();
+        self.diff_lines = if row.entry_indexes.is_empty() {
+            vec!["No diff available".into()]
+        } else if row.entry_indexes.len() == 1 {
+            let entry = &self.entries[row.entry_indexes[0]];
+            git::get_status_diff(Path::new("."), entry)
+                .unwrap_or_else(|err| format!("Failed to load diff: {err}"))
+                .lines()
+                .map(|line| line.to_string())
+                .collect()
+        } else {
+            let mut lines = Vec::new();
+            for (position, &index) in row.entry_indexes.iter().enumerate() {
+                let entry = &self.entries[index];
+                if position > 0 {
+                    lines.push(String::new());
+                }
+                lines.push(format!("=== {} ===", entry.path));
+                let diff = git::get_status_diff(Path::new("."), entry)
+                    .unwrap_or_else(|err| format!("Failed to load diff: {err}"));
+                if diff.trim().is_empty() {
+                    lines.push("No diff available".into());
+                } else {
+                    lines.extend(diff.lines().map(|line| line.to_string()));
+                }
+            }
+            lines
+        };
         if self.diff_lines.is_empty() {
             self.diff_lines.push("No diff available".into());
         }
+    }
+
+    fn selected_row(&self) -> Option<&TreeRow> {
+        self.tree_rows.get(self.selected_row)
     }
 }
 
@@ -565,12 +634,28 @@ fn status_flags(entry: &StatusEntry) -> &'static str {
     }
 }
 
-fn status_color(entry: &StatusEntry, ctx: &AppContext) -> ratatui::style::Color {
-    if entry.untracked {
+fn status_color_for_indexes(
+    indexes: &[usize],
+    entries: &[StatusEntry],
+    ctx: &AppContext,
+) -> ratatui::style::Color {
+    let mut any_untracked = false;
+    let mut any_unstaged = false;
+    let mut any_staged = false;
+    for &index in indexes {
+        let Some(entry) = entries.get(index) else {
+            continue;
+        };
+        any_untracked |= entry.untracked;
+        any_unstaged |= entry.unstaged;
+        any_staged |= entry.staged;
+    }
+
+    if any_untracked {
         ctx.color_theme.status_warn_fg
-    } else if entry.staged && entry.unstaged {
+    } else if any_staged && any_unstaged {
         ctx.color_theme.list_ref_tag_fg
-    } else if entry.staged {
+    } else if any_staged {
         ctx.color_theme.status_success_fg
     } else {
         ctx.color_theme.status_error_fg
@@ -588,7 +673,8 @@ fn insert_entry(root: &mut TreeNode, path: &str, entry_index: usize) {
 fn build_tree_rows(
     rows: &mut Vec<TreeRow>,
     node: &TreeNode,
-    prefix: &str,
+    visual_prefix: &str,
+    path_prefix: &str,
     is_root: bool,
     entries: &[StatusEntry],
 ) {
@@ -602,31 +688,53 @@ fn build_tree_rows(
         } else {
             "├─ "
         };
+        let path = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{path_prefix}/{name}")
+        };
 
         if let Some(entry_index) = child.entry_index {
             let state = status_flags(&entries[entry_index]);
             rows.push(TreeRow {
-                label: format!("{prefix}{connector}[{state}] {name}"),
-                entry_index: Some(entry_index),
+                path: path.clone(),
+                is_dir: false,
+                label: format!("{visual_prefix}{connector}[{state}] {name}"),
+                entry_indexes: vec![entry_index],
             });
         } else {
+            let entry_indexes = collect_entry_indexes(child);
             rows.push(TreeRow {
-                label: format!("{prefix}{connector}{name}/"),
-                entry_index: None,
+                path: path.clone(),
+                is_dir: true,
+                label: format!("{visual_prefix}{connector}{name}/"),
+                entry_indexes,
             });
         }
 
         if !child.children.is_empty() {
-            let next_prefix = if is_root {
+            let next_visual_prefix = if is_root {
                 String::new()
             } else if is_last {
-                format!("{prefix}   ")
+                format!("{visual_prefix}   ")
             } else {
-                format!("{prefix}│  ")
+                format!("{visual_prefix}│  ")
             };
-            build_tree_rows(rows, child, &next_prefix, false, entries);
+            build_tree_rows(rows, child, &next_visual_prefix, &path, false, entries);
         }
     }
+}
+
+fn collect_entry_indexes(node: &TreeNode) -> Vec<usize> {
+    let mut indexes = Vec::new();
+    if let Some(entry_index) = node.entry_index {
+        indexes.push(entry_index);
+    }
+    for child in node.children.values() {
+        indexes.extend(collect_entry_indexes(child));
+    }
+    indexes.sort_unstable();
+    indexes
 }
 
 fn style_diff_line(line: &str, ctx: &AppContext) -> Line<'static> {
