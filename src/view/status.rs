@@ -1,4 +1,9 @@
-use std::{cmp::min, collections::BTreeMap, path::Path, rc::Rc};
+use std::{
+    cmp::min,
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    rc::Rc,
+};
 
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
@@ -14,6 +19,7 @@ use tui_input::{backend::crossterm::EventHandler, Input};
 use crate::{
     app::AppContext,
     event::{AppEvent, Sender, UserEvent, UserEventWithCount},
+    external::generate_commit_message_with_codex,
     git::{self, StatusEntry},
     view::{ListRefreshViewContext, RefreshViewContext, StatusRefreshViewContext},
     widget::commit_list::CommitListState,
@@ -37,6 +43,8 @@ impl Default for FocusArea {
 struct TreeRow {
     path: String,
     is_dir: bool,
+    is_expanded: bool,
+    has_children: bool,
     label: String,
     entry_indexes: Vec<usize>,
 }
@@ -51,6 +59,7 @@ struct TreeNode {
 struct StatusUiState {
     file_offset: usize,
     diff_offset: usize,
+    expanded_dirs: BTreeSet<String>,
     focus: FocusArea,
     title: Input,
     description: TextArea<'static>,
@@ -85,6 +94,7 @@ impl<'a> StatusView<'a> {
             ctx,
             tx,
         };
+        view.ui.expanded_dirs = collect_directory_paths(&view.entries);
         view.ui.focus = FocusArea::Files;
         view.ui.title = Input::default().with_value(String::new());
         view.ui
@@ -110,8 +120,8 @@ impl<'a> StatusView<'a> {
             self.ui.focus = FocusArea::Files;
             return;
         }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.cycle_focus(matches!(key.code, KeyCode::BackTab));
+        if is_forward_tab(key) || is_reverse_tab(key) {
+            self.cycle_focus(is_reverse_tab(key));
             return;
         }
 
@@ -197,7 +207,10 @@ impl<'a> StatusView<'a> {
                 }
                 UserEvent::GoToTop => self.select_first(),
                 UserEvent::GoToBottom => self.select_last(),
-                UserEvent::Confirm | UserEvent::StatusToggle => self.toggle_selected(),
+                UserEvent::NavigateRight => self.expand_selected_dir(),
+                UserEvent::NavigateLeft => self.collapse_selected_dir(),
+                UserEvent::Confirm => self.activate_selected(),
+                UserEvent::StatusToggle => self.toggle_selected(),
                 UserEvent::StatusDiscard => self.discard_selected(),
                 _ => {}
             },
@@ -266,16 +279,15 @@ impl<'a> StatusView<'a> {
                     line = line
                         .fg(self.ctx.color_theme.ref_selected_fg)
                         .bg(self.ctx.color_theme.ref_selected_bg);
-                } else if row.is_dir {
-                    line = line
-                        .fg(self.ctx.color_theme.detail_label_fg)
-                        .add_modifier(Modifier::BOLD);
                 } else if !row.entry_indexes.is_empty() {
                     line = line.fg(status_color_for_indexes(
                         &row.entry_indexes,
                         &self.entries,
                         &self.ctx,
                     ));
+                }
+                if row.is_dir && !is_selected {
+                    line = line.add_modifier(Modifier::BOLD);
                 }
                 if is_selected && self.ui.focus == FocusArea::Files && !self.entries.is_empty() {
                     line = line.add_modifier(Modifier::BOLD);
@@ -284,25 +296,14 @@ impl<'a> StatusView<'a> {
             })
             .collect::<Vec<_>>();
 
-        let selected_path = self
-            .tree_rows
-            .get(selected_row)
-            .map(|row| row.path.as_str())
-            .unwrap_or("clean");
-        let selected_count = self
-            .tree_rows
-            .get(selected_row)
-            .map(|row| row.entry_indexes.len())
-            .unwrap_or(0);
         let title = format!(
-            "Changes [{}]{} {} ({selected_count})",
+            "Changes [{}]{}",
             self.entries.len(),
             if self.ui.focus == FocusArea::Files {
                 " *"
             } else {
                 ""
-            },
-            selected_path
+            }
         );
         let paragraph = Paragraph::new(lines).block(
             Block::default()
@@ -329,7 +330,14 @@ impl<'a> StatusView<'a> {
             .map(|line| style_diff_line(line, &self.ctx))
             .collect::<Vec<_>>();
 
-        let title = "Diff";
+        let selected_row = self.tree_rows.get(
+            self.selected_row
+                .min(self.tree_rows.len().saturating_sub(1)),
+        );
+        let title = match selected_row {
+            Some(row) => format!("Diff {} ({})", row.path, row.entry_indexes.len()),
+            None => "Diff".to_string(),
+        };
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .title(title)
@@ -465,6 +473,17 @@ impl<'a> StatusView<'a> {
         }
     }
 
+    fn activate_selected(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.is_dir && row.has_children {
+            self.toggle_dir_expanded(row.path.clone());
+            return;
+        }
+        self.toggle_selected();
+    }
+
     fn toggle_selected(&self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -543,16 +562,24 @@ impl<'a> StatusView<'a> {
         }
 
         let title = self.ui.title.value().trim();
-        if title.is_empty() {
-            self.tx
-                .send(AppEvent::NotifyError("Commit title cannot be empty".into()));
-            return;
-        }
-
         let desc_text = self.ui.description.lines().join("\n");
         let desc = desc_text.trim();
-        let message = if desc.is_empty() {
-            title.to_string()
+
+        let message = if title.is_empty() || desc.is_empty() {
+            let staged_diff = match git::get_staged_diff(Path::new(".")) {
+                Ok(diff) => diff,
+                Err(err) => {
+                    self.tx.send(AppEvent::NotifyError(err.to_string()));
+                    return;
+                }
+            };
+            match generate_commit_message_with_codex(Path::new("."), &staged_diff) {
+                Ok(message) => message,
+                Err(err) => {
+                    self.tx.send(AppEvent::NotifyError(err));
+                    return;
+                }
+            }
         } else {
             format!("{title}\n\n{desc}")
         };
@@ -569,17 +596,26 @@ impl<'a> StatusView<'a> {
             self.tree_rows.push(TreeRow {
                 path: String::new(),
                 is_dir: false,
+                is_expanded: false,
+                has_children: false,
                 label: "No changes".into(),
                 entry_indexes: Vec::new(),
             });
             return;
         }
-
         let mut root = TreeNode::default();
         for (entry_index, entry) in self.entries.iter().enumerate() {
             insert_entry(&mut root, &entry.path, entry_index);
         }
-        build_tree_rows(&mut self.tree_rows, &root, "", "", true, &self.entries);
+        build_tree_rows(
+            &mut self.tree_rows,
+            &root,
+            "",
+            "",
+            true,
+            &self.entries,
+            &self.ui.expanded_dirs,
+        );
     }
 
     fn refresh_diff(&mut self) {
@@ -622,6 +658,60 @@ impl<'a> StatusView<'a> {
 
     fn selected_row(&self) -> Option<&TreeRow> {
         self.tree_rows.get(self.selected_row)
+    }
+
+    fn toggle_dir_expanded(&mut self, path: String) {
+        if !self.ui.expanded_dirs.insert(path.clone()) {
+            self.ui.expanded_dirs.remove(&path);
+        }
+        self.rebuild_tree_rows();
+        self.restore_selected_path(&path);
+        self.refresh_diff();
+    }
+
+    fn expand_selected_dir(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if !(row.is_dir && row.has_children) || row.is_expanded {
+            return;
+        }
+        let path = row.path.clone();
+        self.ui.expanded_dirs.insert(path.clone());
+        self.rebuild_tree_rows();
+        self.restore_selected_path(&path);
+        self.refresh_diff();
+    }
+
+    fn collapse_selected_dir(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.is_dir && row.has_children && row.is_expanded {
+            let path = row.path.clone();
+            self.ui.expanded_dirs.remove(&path);
+            self.rebuild_tree_rows();
+            self.restore_selected_path(&path);
+            self.refresh_diff();
+            return;
+        }
+
+        let Some((parent_path, _)) = row.path.rsplit_once('/') else {
+            return;
+        };
+        let parent_path = parent_path.to_string();
+        self.restore_selected_path(&parent_path);
+        self.refresh_diff();
+    }
+
+    fn restore_selected_path(&mut self, path: &str) {
+        if let Some(index) = self.tree_rows.iter().position(|row| row.path == path) {
+            self.selected_row = index;
+        } else {
+            self.selected_row = self
+                .selected_row
+                .min(self.tree_rows.len().saturating_sub(1));
+        }
     }
 }
 
@@ -699,13 +789,44 @@ fn text_area_is_empty(text_area: &TextArea<'_>) -> bool {
     text_area.lines().iter().all(|line| line.is_empty())
 }
 
-fn status_flags(entry: &StatusEntry) -> &'static str {
+fn is_forward_tab(key: KeyEvent) -> bool {
+    key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn is_reverse_tab(key: KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn status_icon(entry: &StatusEntry) -> &'static str {
     match (entry.staged, entry.unstaged, entry.untracked) {
-        (_, _, true) => "??",
-        (true, true, false) => "SM",
-        (true, false, false) => "S ",
-        (false, true, false) => " M",
-        _ => "  ",
+        (_, _, true) => "?",
+        (true, true, false) => "±",
+        (true, false, false) => "•",
+        (false, true, false) => "~",
+        _ => "·",
+    }
+}
+
+fn status_icon_for_indexes(indexes: &[usize], entries: &[StatusEntry]) -> &'static str {
+    let mut any_untracked = false;
+    let mut any_unstaged = false;
+    let mut any_staged = false;
+    for &index in indexes {
+        let Some(entry) = entries.get(index) else {
+            continue;
+        };
+        any_untracked |= entry.untracked;
+        any_unstaged |= entry.unstaged;
+        any_staged |= entry.staged;
+    }
+
+    match (any_staged, any_unstaged, any_untracked) {
+        (_, _, true) => "?",
+        (true, true, false) => "±",
+        (true, false, false) => "•",
+        (false, true, false) => "~",
+        _ => "·",
     }
 }
 
@@ -752,6 +873,7 @@ fn build_tree_rows(
     path_prefix: &str,
     is_root: bool,
     entries: &[StatusEntry],
+    expanded_dirs: &BTreeSet<String>,
 ) {
     let child_count = node.children.len();
     for (position, (name, child)) in node.children.iter().enumerate() {
@@ -770,24 +892,40 @@ fn build_tree_rows(
         };
 
         if let Some(entry_index) = child.entry_index {
-            let state = status_flags(&entries[entry_index]);
+            let state = status_icon(&entries[entry_index]);
             rows.push(TreeRow {
                 path: path.clone(),
                 is_dir: false,
-                label: format!("{visual_prefix}{connector}[{state}] {name}"),
+                is_expanded: false,
+                has_children: false,
+                label: format!("{visual_prefix}{connector}{state} {name}"),
                 entry_indexes: vec![entry_index],
             });
         } else {
             let entry_indexes = collect_entry_indexes(child);
+            let has_children = !child.children.is_empty();
+            let is_expanded = expanded_dirs.contains(&path);
+            let expand_marker = if has_children {
+                if is_expanded {
+                    "▾"
+                } else {
+                    "▸"
+                }
+            } else {
+                " "
+            };
+            let state = status_icon_for_indexes(&entry_indexes, entries);
             rows.push(TreeRow {
                 path: path.clone(),
                 is_dir: true,
-                label: format!("{visual_prefix}{connector}{name}/"),
+                is_expanded,
+                has_children,
+                label: format!("{visual_prefix}{connector}{state} {expand_marker} {name}/"),
                 entry_indexes,
             });
         }
 
-        if !child.children.is_empty() {
+        if !child.children.is_empty() && expanded_dirs.contains(&path) {
             let next_visual_prefix = if is_root {
                 String::new()
             } else if is_last {
@@ -795,7 +933,15 @@ fn build_tree_rows(
             } else {
                 format!("{visual_prefix}│  ")
             };
-            build_tree_rows(rows, child, &next_visual_prefix, &path, false, entries);
+            build_tree_rows(
+                rows,
+                child,
+                &next_visual_prefix,
+                &path,
+                false,
+                entries,
+                expanded_dirs,
+            );
         }
     }
 }
@@ -810,6 +956,27 @@ fn collect_entry_indexes(node: &TreeNode) -> Vec<usize> {
     }
     indexes.sort_unstable();
     indexes
+}
+
+fn collect_directory_paths(entries: &[StatusEntry]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for entry in entries {
+        let mut current = String::new();
+        let mut components = entry.path.split('/').peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                break;
+            }
+            if current.is_empty() {
+                current.push_str(component);
+            } else {
+                current.push('/');
+                current.push_str(component);
+            }
+            paths.insert(current.clone());
+        }
+    }
+    paths
 }
 
 fn style_diff_line(line: &str, ctx: &AppContext) -> Line<'static> {

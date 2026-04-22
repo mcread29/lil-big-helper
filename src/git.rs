@@ -893,16 +893,19 @@ pub fn get_initial_commit_additions(path: &Path, commit_hash: &CommitHash) -> Ve
 }
 
 pub fn get_status_entries(path: &Path) -> Vec<StatusEntry> {
-    git_lines(
-        Command::new("git")
-            .arg("status")
-            .arg("--short")
-            .arg("--untracked-files=all")
-            .current_dir(path),
-    )
-    .into_iter()
-    .filter_map(|line| parse_status_entry(&line))
-    .collect()
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--no-renames")
+        .arg("--untracked-files=all")
+        .current_dir(path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => parse_status_entries_z(&output.stdout),
+        _ => Vec::new(),
+    }
 }
 
 pub fn get_status_diff(path: &Path, entry: &StatusEntry) -> Result<String> {
@@ -967,6 +970,18 @@ pub fn get_status_diff(path: &Path, entry: &StatusEntry) -> Result<String> {
     }
 }
 
+pub fn get_staged_diff(path: &Path) -> Result<String> {
+    git_diff_output(
+        Command::new("git")
+            .arg("diff")
+            .arg("--cached")
+            .arg("--no-color")
+            .arg("--no-ext-diff")
+            .current_dir(path),
+        false,
+    )
+}
+
 pub fn stage_path(path: &Path, file_path: &str) -> Result<()> {
     run_git(
         Command::new("git")
@@ -1012,18 +1027,25 @@ pub fn discard_untracked_path(path: &Path, file_path: &str) -> Result<()> {
     )
 }
 
-fn parse_status_entry(line: &str) -> Option<StatusEntry> {
-    if line.len() < 4 {
+fn parse_status_entries_z(stdout: &[u8]) -> Vec<StatusEntry> {
+    stdout
+        .split(|b| *b == 0)
+        .filter_map(parse_status_entry_z)
+        .collect()
+}
+
+fn parse_status_entry_z(record: &[u8]) -> Option<StatusEntry> {
+    if record.len() < 4 {
         return None;
     }
 
-    let staged_code = line.chars().next()?;
-    let unstaged_code = line.chars().nth(1)?;
-    let raw_path = line[3..].trim();
-    let path = raw_path
-        .rsplit_once(" -> ")
-        .map(|(_, to)| to.to_string())
-        .unwrap_or_else(|| raw_path.to_string());
+    let staged_code = record[0] as char;
+    let unstaged_code = record[1] as char;
+    if record[2] != b' ' {
+        return None;
+    }
+
+    let path = String::from_utf8(record[3..].to_vec()).ok()?;
 
     Some(StatusEntry {
         path,
@@ -1047,5 +1069,30 @@ fn git_diff_output(cmd: &mut Command, allow_exit_code_one: bool) -> Result<Strin
         Err("git command failed".into())
     } else {
         Err(message.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_status_entry_z_preserves_top_level_filename() {
+        let entry = parse_status_entry_z(b" M package-lock.json").unwrap();
+        assert_eq!(entry.path, "package-lock.json");
+        assert!(!entry.staged);
+        assert!(entry.unstaged);
+        assert!(!entry.untracked);
+    }
+
+    #[test]
+    fn parse_status_entries_z_parses_multiple_records() {
+        let stdout = b" M package-lock.json\0?? src/app.ts\0";
+        let entries = parse_status_entries_z(stdout);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "package-lock.json");
+        assert_eq!(entries[1].path, "src/app.ts");
+        assert!(entries[1].untracked);
     }
 }

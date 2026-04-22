@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
     text::Line,
-    widgets::{Block, Borders, Padding, Paragraph},
+    widgets::{Block, Paragraph},
     DefaultTerminal, Frame,
 };
 use rustc_hash::FxHashMap;
@@ -241,6 +241,14 @@ impl App<'_> {
                             self.app_status.numeric_prefix.clear();
                         }
                         None => {
+                            if is_reverse_tab_key(key) {
+                                self.app_status.numeric_prefix.clear();
+                                self.view.handle_event(
+                                    UserEventWithCount::from_event(UserEvent::Unknown),
+                                    key,
+                                );
+                                continue;
+                            }
                             if let StatusLine::Input(_, _, _) = self.app_status.status_line {
                                 // In input mode, pass all key events to the view
                                 // fixme: currently, the only thing that processes key_event is searching the list,
@@ -283,7 +291,7 @@ impl App<'_> {
                     self.open_set_branch_prefix_prompt();
                 }
                 AppEvent::OpenStatus => {
-                    self.clear_image(Some(terminal))?;
+                    terminal.clear()?;
                     self.open_status();
                 }
                 AppEvent::CloseStatus => {
@@ -374,7 +382,7 @@ impl App<'_> {
         f.render_widget(base, f.area());
 
         let [view_area, status_line_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(f.area());
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
 
         self.update_state(view_area);
 
@@ -423,16 +431,11 @@ impl App<'_> {
                 .add_modifier(Modifier::BOLD)
                 .fg(self.ctx.color_theme.status_error_fg),
         };
-        let paragraph = Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                .padding(Padding::horizontal(1)),
-        );
+        let paragraph = Paragraph::new(text);
         f.render_widget(paragraph, area);
 
         if let StatusLine::Input(_, Some(cursor_pos), _) = &self.app_status.status_line {
-            let (x, y) = (area.x + cursor_pos + 1, area.y + 1);
+            let (x, y) = (area.x + cursor_pos, area.y);
             match &self.ctx.ui_config.common.cursor_type {
                 CursorType::Native => {
                     f.set_cursor_position((x, y));
@@ -1305,6 +1308,14 @@ fn process_numeric_prefix(
     } else {
         UserEventWithCount::from_event(user_event)
     }
+}
+
+fn is_reverse_tab_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab
+            && key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::SHIFT))
 }
 
 fn extract_user_command_by_number(
