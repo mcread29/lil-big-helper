@@ -396,15 +396,17 @@ impl<'a> StatusView<'a> {
         let desc_focused = self.ui.focus == FocusArea::Description;
         self.ui.title.set_block(
             Block::default()
-                .title(header)
-                .title_bottom(if title_focused { "Title *" } else { "Title" })
+                .title(format!(
+                    "{header}  |  {}",
+                    if title_focused { "Title *" } else { "Title" }
+                ))
                 .borders(Borders::ALL)
                 .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                 .padding(Padding::horizontal(1)),
         );
         self.ui.description.set_block(
             Block::default()
-                .title_bottom(if desc_focused {
+                .title(if desc_focused {
                     "Description *"
                 } else {
                     "Description"
