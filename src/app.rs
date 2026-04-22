@@ -55,6 +55,8 @@ struct PromptState {
     label: String,
     input: Input,
     transient: Option<String>,
+    selector_options: Vec<String>,
+    selector_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -468,17 +470,26 @@ impl App<'_> {
             .ok()
             .and_then(|state| state.get_branch_origin(&branch).map(str::to_string))
             .unwrap_or_else(|| "unset".into());
-        let protected = self.git_helper_config().protected_base_branches.join(", ");
-        self.open_prompt(
-            PromptKind::SetBase,
-            format!("Base branch for {branch}"),
-            Some(format!("Current: {current_base}. Options: {protected}")),
-            if current_base == "unset" {
-                None
-            } else {
-                Some(current_base)
-            },
-        );
+        let selector_options = self.git_helper_config().protected_base_branches.clone();
+        let selector_index = selector_options
+            .iter()
+            .position(|option| option == &current_base)
+            .unwrap_or(0);
+        let mut input = Input::default();
+        if let Some(current) = selector_options.get(selector_index) {
+            input = input.with_value(current.clone());
+        }
+        self.app_status.prompt = Some(PromptState {
+            kind: PromptKind::SetBase,
+            label: format!("Base branch for {branch}"),
+            input,
+            transient: Some(format!(
+                "Current: {current_base}. Use left/right or j/k, Enter to confirm."
+            )),
+            selector_options,
+            selector_index,
+        });
+        self.refresh_prompt_status_line();
     }
 
     fn open_set_branch_prefix_prompt(&mut self) {
@@ -510,15 +521,27 @@ impl App<'_> {
             label,
             input,
             transient,
+            selector_options: Vec::new(),
+            selector_index: 0,
         });
         self.refresh_prompt_status_line();
     }
 
     fn refresh_prompt_status_line(&mut self) {
         if let Some(prompt) = &self.app_status.prompt {
-            let text = format!("{}: {}", prompt.label, prompt.input.value());
-            let cursor = text.len() as u16;
-            self.update_status_input(text, Some(cursor), prompt.transient.clone());
+            if prompt.selector_options.is_empty() {
+                let text = format!("{}: {}", prompt.label, prompt.input.value());
+                let cursor = text.len() as u16;
+                self.update_status_input(text, Some(cursor), prompt.transient.clone());
+            } else {
+                let current = prompt
+                    .selector_options
+                    .get(prompt.selector_index)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let text = format!("{}: < {} >", prompt.label, current);
+                self.update_status_input(text, None, prompt.transient.clone());
+            }
         }
     }
 
@@ -537,9 +560,31 @@ impl App<'_> {
             }
             _ => {
                 if let Some(prompt) = &mut self.app_status.prompt {
-                    prompt
-                        .input
-                        .handle_event(&ratatui::crossterm::event::Event::Key(key));
+                    if prompt.selector_options.is_empty() {
+                        prompt
+                            .input
+                            .handle_event(&ratatui::crossterm::event::Event::Key(key));
+                    } else {
+                        match key.code {
+                            KeyCode::Left | KeyCode::Up | KeyCode::BackTab | KeyCode::Char('h')
+                            | KeyCode::Char('k') => {
+                                if prompt.selector_index == 0 {
+                                    prompt.selector_index = prompt.selector_options.len() - 1;
+                                } else {
+                                    prompt.selector_index -= 1;
+                                }
+                            }
+                            KeyCode::Right
+                            | KeyCode::Down
+                            | KeyCode::Tab
+                            | KeyCode::Char('j')
+                            | KeyCode::Char('l') => {
+                                prompt.selector_index =
+                                    (prompt.selector_index + 1) % prompt.selector_options.len();
+                            }
+                            _ => {}
+                        }
+                    }
                     self.refresh_prompt_status_line();
                 }
             }
@@ -552,7 +597,15 @@ impl App<'_> {
         };
         self.clear_status_line();
 
-        let value = prompt.input.value().trim().to_string();
+        let value = if prompt.selector_options.is_empty() {
+            prompt.input.value().trim().to_string()
+        } else {
+            prompt
+                .selector_options
+                .get(prompt.selector_index)
+                .cloned()
+                .unwrap_or_default()
+        };
         match prompt.kind {
             PromptKind::ActionMenu => self.submit_action_menu(value.as_str()),
             PromptKind::CreateBranchBase => {
