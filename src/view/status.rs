@@ -2,9 +2,9 @@ use std::{cmp::min, collections::BTreeMap, path::Path, rc::Rc};
 
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
@@ -22,7 +22,6 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusArea {
     Files,
-    Diff,
     Title,
     Description,
     Button,
@@ -90,7 +89,10 @@ impl<'a> StatusView<'a> {
         view.ui.title = Input::default().with_value(String::new());
         view.ui
             .description
-            .set_placeholder_text("Commit description");
+            .set_style(Style::default().fg(view.ctx.color_theme.status_input_fg));
+        view.ui.description.set_placeholder_style(
+            Style::default().fg(view.ctx.color_theme.status_input_transient_fg),
+        );
         view.ui.description.set_cursor_style(
             Style::default()
                 .fg(view.ctx.color_theme.ref_selected_fg)
@@ -199,25 +201,6 @@ impl<'a> StatusView<'a> {
                 UserEvent::StatusDiscard => self.discard_selected(),
                 _ => {}
             },
-            FocusArea::Diff => match event_with_count.event {
-                UserEvent::NavigateDown | UserEvent::ScrollDown => {
-                    self.ui.diff_offset = self.ui.diff_offset.saturating_add(count);
-                }
-                UserEvent::NavigateUp | UserEvent::ScrollUp => {
-                    self.ui.diff_offset = self.ui.diff_offset.saturating_sub(count);
-                }
-                UserEvent::PageDown | UserEvent::HalfPageDown => {
-                    self.ui.diff_offset = self.ui.diff_offset.saturating_add(10 * count);
-                }
-                UserEvent::PageUp | UserEvent::HalfPageUp => {
-                    self.ui.diff_offset = self.ui.diff_offset.saturating_sub(10 * count);
-                }
-                UserEvent::GoToTop => self.ui.diff_offset = 0,
-                UserEvent::GoToBottom => {
-                    self.ui.diff_offset = self.diff_lines.len().saturating_sub(1);
-                }
-                _ => {}
-            },
             FocusArea::Title | FocusArea::Description => self.handle_text_input(key),
             FocusArea::Button => {
                 if matches!(
@@ -248,14 +231,12 @@ impl<'a> StatusView<'a> {
 
     fn cycle_focus(&mut self, reverse: bool) {
         self.ui.focus = match (self.ui.focus, reverse) {
-            (FocusArea::Files, false) => FocusArea::Diff,
-            (FocusArea::Diff, false) => FocusArea::Title,
+            (FocusArea::Files, false) => FocusArea::Title,
             (FocusArea::Title, false) => FocusArea::Description,
             (FocusArea::Description, false) => FocusArea::Button,
             (FocusArea::Button, false) => FocusArea::Files,
             (FocusArea::Files, true) => FocusArea::Button,
-            (FocusArea::Diff, true) => FocusArea::Files,
-            (FocusArea::Title, true) => FocusArea::Diff,
+            (FocusArea::Title, true) => FocusArea::Files,
             (FocusArea::Description, true) => FocusArea::Title,
             (FocusArea::Button, true) => FocusArea::Description,
         };
@@ -348,14 +329,7 @@ impl<'a> StatusView<'a> {
             .map(|line| style_diff_line(line, &self.ctx))
             .collect::<Vec<_>>();
 
-        let title = format!(
-            "Diff{}",
-            if self.ui.focus == FocusArea::Diff {
-                " *"
-            } else {
-                ""
-            }
-        );
+        let title = "Diff";
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .title(title)
@@ -367,12 +341,10 @@ impl<'a> StatusView<'a> {
     }
 
     fn render_commit_form(&mut self, f: &mut Frame, area: Rect) {
-        let [title_area, desc_area, button_area] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(4),
-            Constraint::Length(3),
-        ])
-        .areas(area);
+        let [top_row_area, desc_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Length(4)]).areas(area);
+        let [title_area, button_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(14)]).areas(top_row_area);
 
         let button_label = if self.ui.focus == FocusArea::Button {
             "[ Commit ]"
@@ -382,6 +354,14 @@ impl<'a> StatusView<'a> {
 
         let title_focused = self.ui.focus == FocusArea::Title;
         let desc_focused = self.ui.focus == FocusArea::Description;
+        self.ui.description.set_placeholder_text("");
+        self.ui.description.set_cursor_style(if desc_focused {
+            Style::default()
+                .fg(self.ctx.color_theme.ref_selected_fg)
+                .bg(self.ctx.color_theme.ref_selected_bg)
+        } else {
+            Style::default()
+        });
         self.ui.description.set_block(
             Block::default()
                 .title(if desc_focused {
@@ -389,14 +369,33 @@ impl<'a> StatusView<'a> {
                 } else {
                     "Description"
                 })
-                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                .borders(Borders::ALL)
                 .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                 .padding(Padding::horizontal(1)),
         );
-        let title_text = if self.ui.title.value().is_empty() {
-            Line::raw("Commit title").fg(self.ctx.color_theme.status_input_transient_fg)
+        let title_empty = self.ui.title.value().is_empty();
+        let title_text = if title_empty {
+            if title_focused {
+                render_empty_input_cursor(
+                    title_area.width,
+                    Style::default()
+                        .fg(self.ctx.color_theme.ref_selected_fg)
+                        .bg(self.ctx.color_theme.ref_selected_bg),
+                )
+            } else {
+                Line::raw("Commit title").fg(self.ctx.color_theme.status_input_transient_fg)
+            }
         } else {
-            render_input_value(&self.ui.title, title_area.width)
+            render_input_value(
+                &self.ui.title,
+                title_area.width,
+                self.ctx.color_theme.status_input_fg,
+                title_focused.then(|| {
+                    Style::default()
+                        .fg(self.ctx.color_theme.ref_selected_fg)
+                        .bg(self.ctx.color_theme.ref_selected_bg)
+                }),
+            )
         };
         f.render_widget(
             Paragraph::new(title_text).block(
@@ -409,28 +408,35 @@ impl<'a> StatusView<'a> {
             title_area,
         );
         f.render_widget(&self.ui.description, desc_area);
+        if !desc_focused && text_area_is_empty(&self.ui.description) {
+            f.render_widget(
+                Paragraph::new(
+                    Line::raw("Commit description")
+                        .fg(self.ctx.color_theme.status_input_transient_fg),
+                ),
+                input_content_area(desc_area),
+            );
+        }
 
-        let button_line = if self.ui.focus == FocusArea::Button {
-            Line::raw(button_label)
-                .fg(self.ctx.color_theme.ref_selected_fg)
-                .bg(self.ctx.color_theme.ref_selected_bg)
-        } else {
-            Line::raw(button_label).fg(self.ctx.color_theme.status_success_fg)
-        };
+        let button_line = Line::raw(button_label);
         f.render_widget(
-            Paragraph::new(button_line).block(
-                Block::default()
-                    .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-                    .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                    .padding(Padding::horizontal(1)),
-            ),
+            Paragraph::new(button_line)
+                .alignment(Alignment::Center)
+                .style(if self.ui.focus == FocusArea::Button {
+                    Style::default()
+                        .fg(self.ctx.color_theme.ref_selected_fg)
+                        .bg(self.ctx.color_theme.ref_selected_bg)
+                } else {
+                    Style::default().fg(self.ctx.color_theme.status_success_fg)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().fg(self.ctx.color_theme.divider_fg))
+                        .padding(Padding::horizontal(1)),
+                ),
             button_area,
         );
-
-        if title_focused {
-            let cursor_x = input_cursor_x(&self.ui.title, title_area);
-            f.set_cursor_position((cursor_x, title_area.y + 1));
-        }
     }
 
     fn select_next(&mut self) {
@@ -619,27 +625,78 @@ impl<'a> StatusView<'a> {
     }
 }
 
-fn render_input_value(input: &Input, area_width: u16) -> Line<'static> {
-    let inner_width = area_width.saturating_sub(3) as usize;
+fn render_input_value(
+    input: &Input,
+    area_width: u16,
+    color: ratatui::style::Color,
+    cursor_style: Option<Style>,
+) -> Line<'static> {
+    let inner_width = input_inner_width(area_width);
     let scroll = input.cursor().saturating_sub(inner_width.max(1));
     let visible = input
         .value()
         .chars()
         .skip(scroll)
         .take(inner_width.max(1))
-        .collect::<String>();
-    if visible.is_empty() {
+        .collect::<Vec<_>>();
+
+    if let Some(cursor_style) = cursor_style {
+        let cursor = input.cursor().saturating_sub(scroll).min(inner_width);
+        let mut line = String::with_capacity(visible.len().max(1));
+        for ch in &visible {
+            line.push(*ch);
+        }
+        while line.len() < inner_width.max(1) {
+            line.push(' ');
+        }
+        let mut spans = Vec::new();
+        let before = line.chars().take(cursor).collect::<String>();
+        if !before.is_empty() {
+            spans.push(before.fg(color));
+        }
+        let cursor_char = line
+            .chars()
+            .nth(cursor)
+            .unwrap_or(' ')
+            .to_string()
+            .fg(ratatui::style::Color::Reset);
+        spans.push(cursor_char.style(cursor_style));
+        let after = line.chars().skip(cursor + 1).collect::<String>();
+        if !after.is_empty() {
+            spans.push(after.fg(color));
+        }
+        Line::from(spans)
+    } else if visible.is_empty() {
         Line::raw(" ")
     } else {
-        Line::raw(visible)
+        Line::raw(visible.into_iter().collect::<String>()).fg(color)
     }
 }
 
-fn input_cursor_x(input: &Input, area: Rect) -> u16 {
-    let inner_width = area.width.saturating_sub(3) as usize;
-    let scroll = input.cursor().saturating_sub(inner_width.max(1));
-    let cursor = input.cursor().saturating_sub(scroll);
-    area.x + 1 + cursor.min(inner_width) as u16
+fn render_empty_input_cursor(area_width: u16, cursor_style: Style) -> Line<'static> {
+    let inner_width = input_inner_width(area_width).max(1);
+    let mut spans = vec![Span::raw(" ").style(cursor_style)];
+    if inner_width > 1 {
+        spans.push(Span::raw(" ".repeat(inner_width - 1)));
+    }
+    Line::from(spans)
+}
+
+fn input_inner_width(area_width: u16) -> usize {
+    area_width.saturating_sub(4) as usize
+}
+
+fn input_content_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn text_area_is_empty(text_area: &TextArea<'_>) -> bool {
+    text_area.lines().iter().all(|line| line.is_empty())
 }
 
 fn status_flags(entry: &StatusEntry) -> &'static str {
