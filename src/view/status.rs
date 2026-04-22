@@ -1,7 +1,7 @@
 use std::{cmp::min, collections::BTreeMap, path::Path, rc::Rc};
 
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
     text::Line,
@@ -9,6 +9,7 @@ use ratatui::{
     Frame,
 };
 use ratatui_textarea::TextArea;
+use tui_input::{backend::crossterm::EventHandler, Input};
 
 use crate::{
     app::AppContext,
@@ -52,7 +53,7 @@ struct StatusUiState {
     file_offset: usize,
     diff_offset: usize,
     focus: FocusArea,
-    title: TextArea<'static>,
+    title: Input,
     description: TextArea<'static>,
 }
 
@@ -86,15 +87,10 @@ impl<'a> StatusView<'a> {
             tx,
         };
         view.ui.focus = FocusArea::Files;
-        view.ui.title.set_placeholder_text("Commit title");
+        view.ui.title = Input::default().with_value(String::new());
         view.ui
             .description
             .set_placeholder_text("Commit description");
-        view.ui.title.set_cursor_style(
-            Style::default()
-                .fg(view.ctx.color_theme.ref_selected_fg)
-                .bg(view.ctx.color_theme.ref_selected_bg),
-        );
         view.ui.description.set_cursor_style(
             Style::default()
                 .fg(view.ctx.color_theme.ref_selected_fg)
@@ -240,7 +236,7 @@ impl<'a> StatusView<'a> {
                 if matches!(key.code, KeyCode::Enter) && key.modifiers == KeyModifiers::NONE {
                     self.ui.focus = FocusArea::Description;
                 } else {
-                    self.ui.title.input(key);
+                    self.ui.title.handle_event(&Event::Key(key));
                 }
             }
             FocusArea::Description => {
@@ -386,13 +382,6 @@ impl<'a> StatusView<'a> {
 
         let title_focused = self.ui.focus == FocusArea::Title;
         let desc_focused = self.ui.focus == FocusArea::Description;
-        self.ui.title.set_block(
-            Block::default()
-                .title(if title_focused { "Title *" } else { "Title" })
-                .borders(Borders::ALL)
-                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                .padding(Padding::horizontal(1)),
-        );
         self.ui.description.set_block(
             Block::default()
                 .title(if desc_focused {
@@ -404,7 +393,21 @@ impl<'a> StatusView<'a> {
                 .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                 .padding(Padding::horizontal(1)),
         );
-        f.render_widget(&self.ui.title, title_area);
+        let title_text = if self.ui.title.value().is_empty() {
+            Line::raw("Commit title").fg(self.ctx.color_theme.status_input_transient_fg)
+        } else {
+            render_input_value(&self.ui.title, title_area.width)
+        };
+        f.render_widget(
+            Paragraph::new(title_text).block(
+                Block::default()
+                    .title(if title_focused { "Title *" } else { "Title" })
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(self.ctx.color_theme.divider_fg))
+                    .padding(Padding::horizontal(1)),
+            ),
+            title_area,
+        );
         f.render_widget(&self.ui.description, desc_area);
 
         let button_line = if self.ui.focus == FocusArea::Button {
@@ -423,6 +426,11 @@ impl<'a> StatusView<'a> {
             ),
             button_area,
         );
+
+        if title_focused {
+            let cursor_x = input_cursor_x(&self.ui.title, title_area);
+            f.set_cursor_position((cursor_x, title_area.y + 1));
+        }
     }
 
     fn select_next(&mut self) {
@@ -528,14 +536,7 @@ impl<'a> StatusView<'a> {
             return;
         }
 
-        let title = self
-            .ui
-            .title
-            .lines()
-            .first()
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim();
+        let title = self.ui.title.value().trim();
         if title.is_empty() {
             self.tx
                 .send(AppEvent::NotifyError("Commit title cannot be empty".into()));
@@ -616,6 +617,29 @@ impl<'a> StatusView<'a> {
     fn selected_row(&self) -> Option<&TreeRow> {
         self.tree_rows.get(self.selected_row)
     }
+}
+
+fn render_input_value(input: &Input, area_width: u16) -> Line<'static> {
+    let inner_width = area_width.saturating_sub(3) as usize;
+    let scroll = input.cursor().saturating_sub(inner_width.max(1));
+    let visible = input
+        .value()
+        .chars()
+        .skip(scroll)
+        .take(inner_width.max(1))
+        .collect::<String>();
+    if visible.is_empty() {
+        Line::raw(" ")
+    } else {
+        Line::raw(visible)
+    }
+}
+
+fn input_cursor_x(input: &Input, area: Rect) -> u16 {
+    let inner_width = area.width.saturating_sub(3) as usize;
+    let scroll = input.cursor().saturating_sub(inner_width.max(1));
+    let cursor = input.cursor().saturating_sub(scroll);
+    area.x + 1 + cursor.min(inner_width) as u16
 }
 
 fn status_flags(entry: &StatusEntry) -> &'static str {
