@@ -9,18 +9,21 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use rustc_hash::FxHashMap;
+use tui_input::{backend::crossterm::EventHandler, Input};
 
 use crate::{
     color::{ColorTheme, GraphColorSet},
-    config::{CoreConfig, CursorType, UiConfig, UserCommand, UserCommandType},
+    config::{CoreConfig, CursorType, GitHelperConfig, UiConfig, UserCommand, UserCommandType},
     event::{AppEvent, EventController, UserEvent, UserEventWithCount},
     external::{
         copy_to_clipboard, exec_user_command, exec_user_command_suspend, ExternalCommandParameters,
     },
-    git::{Commit, FileChange, Head, Ref, Repository},
+    git::{self, Commit, FileChange, Head, Ref, Repository},
     graph::{CellWidthType, Graph, GraphImageManager},
     keybind::KeyBind,
     protocol::ImageProtocol,
+    protection,
+    repo_state::{load_repo_state, save_repo_state},
     view::{RefreshViewContext, View},
     widget::commit_list::{CommitInfo, CommitListState},
 };
@@ -34,6 +37,23 @@ enum StatusLine {
     NotificationSuccess(String),
     NotificationWarn(String),
     NotificationError(String),
+}
+
+#[derive(Debug)]
+enum PromptKind {
+    ActionMenu,
+    CreateBranchBase,
+    CreateBranchSuffix { base_branch: String },
+    SwitchBranch,
+    CommitMessage,
+}
+
+#[derive(Debug)]
+struct PromptState {
+    kind: PromptKind,
+    label: String,
+    input: Input,
+    transient: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +85,7 @@ struct AppStatus {
     status_line: StatusLine,
     numeric_prefix: String,
     view_area: Rect,
+    prompt: Option<PromptState>,
 }
 
 #[derive(Debug)]
@@ -152,6 +173,10 @@ impl App<'_> {
             terminal.draw(|f| self.render(f))?;
             match self.ec.recv() {
                 AppEvent::Key(key) => {
+                    if self.app_status.prompt.is_some() {
+                        self.handle_prompt_key(key);
+                        continue;
+                    }
                     match self.app_status.status_line {
                         StatusLine::None | StatusLine::Input(_, _, _) => {
                             // do nothing
@@ -216,6 +241,18 @@ impl App<'_> {
                 AppEvent::Quit => {
                     return Ok(Ret::Quit);
                 }
+                AppEvent::OpenActionMenu => {
+                    self.open_action_menu();
+                }
+                AppEvent::OpenCreateBranchPrompt => {
+                    self.open_create_branch_prompt();
+                }
+                AppEvent::OpenSwitchBranchPrompt => {
+                    self.open_switch_branch_prompt();
+                }
+                AppEvent::OpenCommitPrompt => {
+                    self.open_commit_prompt();
+                }
                 AppEvent::OpenDetail => {
                     self.clear_image(Some(terminal))?;
                     self.open_detail();
@@ -279,6 +316,15 @@ impl App<'_> {
                 }
                 AppEvent::NotifyError(msg) => {
                     self.error_notification(msg);
+                }
+                AppEvent::PushCurrentBranch => {
+                    self.push_current_branch();
+                }
+                AppEvent::MergeBaseIntoCurrent => {
+                    self.merge_base_into_current();
+                }
+                AppEvent::InstallHook => {
+                    self.install_hook();
                 }
             }
         }
@@ -364,6 +410,365 @@ impl App<'_> {
 }
 
 impl App<'_> {
+    fn open_action_menu(&mut self) {
+        self.open_prompt(
+            PromptKind::ActionMenu,
+            "Action [b:create s:switch c:commit p:push m:merge i:hook r:refresh]".into(),
+            None,
+            None,
+        );
+    }
+
+    fn open_create_branch_prompt(&mut self) {
+        if let Some(base_branch) = self.infer_base_branch_for_create() {
+            self.open_prompt(
+                PromptKind::CreateBranchSuffix { base_branch },
+                format!("New branch suffix [{} / <name>]", self.git_helper_config().branch_prefix),
+                None,
+                None,
+            );
+            return;
+        }
+
+        let bases = self.git_helper_config().protected_base_branches.join(", ");
+        self.open_prompt(
+            PromptKind::CreateBranchBase,
+            "Base branch".into(),
+            Some(format!("Protected bases: {bases}")),
+            None,
+        );
+    }
+
+    fn open_switch_branch_prompt(&mut self) {
+        let branches = git::get_local_branches(std::path::Path::new(".")).join(", ");
+        self.open_prompt(
+            PromptKind::SwitchBranch,
+            "Switch branch".into(),
+            if branches.is_empty() {
+                None
+            } else {
+                Some(format!("Local branches: {branches}"))
+            },
+            None,
+        );
+    }
+
+    fn open_commit_prompt(&mut self) {
+        match git::get_current_branch(std::path::Path::new(".")) {
+            Some(branch) if protection::is_protected_branch(&branch, self.git_helper_config()) => {
+                self.error_notification(format!(
+                    "Direct commits to protected branch '{branch}' are blocked"
+                ));
+            }
+            Some(_) if !git::has_staged_changes(std::path::Path::new(".")) => {
+                self.error_notification("No staged changes to commit".into());
+            }
+            Some(_) => self.open_prompt(PromptKind::CommitMessage, "Commit message".into(), None, None),
+            None => self.error_notification("Not on a branch".into()),
+        }
+    }
+
+    fn open_prompt(
+        &mut self,
+        kind: PromptKind,
+        label: String,
+        transient: Option<String>,
+        initial_value: Option<String>,
+    ) {
+        let mut input = Input::default();
+        if let Some(value) = initial_value {
+            input = input.with_value(value);
+        }
+        self.app_status.prompt = Some(PromptState {
+            kind,
+            label,
+            input,
+            transient,
+        });
+        self.refresh_prompt_status_line();
+    }
+
+    fn refresh_prompt_status_line(&mut self) {
+        if let Some(prompt) = &self.app_status.prompt {
+            let text = format!("{}: {}", prompt.label, prompt.input.value());
+            let cursor = text.len() as u16;
+            self.update_status_input(text, Some(cursor), prompt.transient.clone());
+        }
+    }
+
+    fn close_prompt(&mut self) {
+        self.app_status.prompt = None;
+        self.clear_status_line();
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_prompt();
+            }
+            KeyCode::Enter => {
+                self.submit_prompt();
+            }
+            _ => {
+                if let Some(prompt) = &mut self.app_status.prompt {
+                    prompt
+                        .input
+                        .handle_event(&ratatui::crossterm::event::Event::Key(key));
+                    self.refresh_prompt_status_line();
+                }
+            }
+        }
+    }
+
+    fn submit_prompt(&mut self) {
+        let Some(prompt) = self.app_status.prompt.take() else {
+            return;
+        };
+        self.clear_status_line();
+
+        let value = prompt.input.value().trim().to_string();
+        match prompt.kind {
+            PromptKind::ActionMenu => self.submit_action_menu(value.as_str()),
+            PromptKind::CreateBranchBase => {
+                if !self
+                    .git_helper_config()
+                    .protected_base_branches
+                    .iter()
+                    .any(|branch| branch == &value)
+                {
+                    self.error_notification(format!("Unknown protected base branch '{value}'"));
+                    return;
+                }
+                self.open_prompt(
+                    PromptKind::CreateBranchSuffix { base_branch: value },
+                    format!(
+                        "New branch suffix [{} / <name>]",
+                        self.git_helper_config().branch_prefix
+                    ),
+                    None,
+                    None,
+                );
+            }
+            PromptKind::CreateBranchSuffix { base_branch } => {
+                if let Err(err) = self.create_branch_from_base(&base_branch, value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+            PromptKind::SwitchBranch => {
+                if let Err(err) = self.switch_branch(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+            PromptKind::CommitMessage => {
+                if let Err(err) = self.commit_changes(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+        }
+    }
+
+    fn submit_action_menu(&mut self, value: &str) {
+        match value.chars().next() {
+            Some('b') => self.open_create_branch_prompt(),
+            Some('s') => self.open_switch_branch_prompt(),
+            Some('c') => self.open_commit_prompt(),
+            Some('p') => self.push_current_branch(),
+            Some('m') => self.merge_base_into_current(),
+            Some('i') => self.install_hook(),
+            Some('r') => self.view.refresh(),
+            Some(other) => self.error_notification(format!("Unknown action '{other}'")),
+            None => self.error_notification("No action selected".into()),
+        }
+    }
+
+    fn git_helper_config(&self) -> &GitHelperConfig {
+        &self.ctx.core_config.git_helper
+    }
+
+    fn infer_base_branch_for_create(&self) -> Option<String> {
+        let protected = &self.git_helper_config().protected_base_branches;
+        if let Some(selected) = self.selected_commit_hash() {
+            for reference in self.repository.refs(&selected) {
+                if let Ref::Branch { name, .. } = reference {
+                    if protected.iter().any(|branch| branch == name) {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(current) = git::get_current_branch(std::path::Path::new(".")) {
+            if protected.iter().any(|branch| branch == &current) {
+                return Some(current);
+            }
+        }
+
+        if protected.len() == 1 {
+            return protected.first().cloned();
+        }
+
+        None
+    }
+
+    fn selected_commit_hash(&self) -> Option<crate::git::CommitHash> {
+        match &self.view {
+            View::List(view) => Some(view.as_list_state().selected_commit_hash().clone()),
+            View::Detail(view) => Some(view.as_list_state().selected_commit_hash().clone()),
+            View::UserCommand(view) => Some(view.as_list_state().selected_commit_hash().clone()),
+            _ => None,
+        }
+    }
+
+    fn ensure_base_worktree(&self, base_branch: &str) -> Result<std::path::PathBuf, String> {
+        let repo_root = git::get_repo_root(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve repository root".to_string())?;
+        let worktree_path = repo_root
+            .join(&self.git_helper_config().hidden_worktree_dir)
+            .join(base_branch);
+
+        if !worktree_path.exists() {
+            if let Some(parent) = worktree_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            }
+            git::add_hidden_base_worktree(std::path::Path::new("."), &worktree_path, base_branch)
+                .map_err(|err| err.to_string())?;
+        }
+
+        if git::get_current_branch(&worktree_path).as_deref() != Some(base_branch) {
+            return Err(format!(
+                "Hidden worktree '{}' is not checked out to '{}'",
+                worktree_path.display(),
+                base_branch
+            ));
+        }
+
+        if git::is_dirty(&worktree_path) {
+            return Err(format!(
+                "Hidden worktree '{}' is dirty",
+                worktree_path.display()
+            ));
+        }
+
+        git::refresh_hidden_base_worktree(&worktree_path, base_branch)
+            .map_err(|err| err.to_string())?;
+        Ok(worktree_path)
+    }
+
+    fn create_branch_from_base(&mut self, base_branch: &str, suffix: &str) -> Result<(), String> {
+        let suffix = suffix.trim().trim_matches('/');
+        if suffix.is_empty() {
+            return Err("Branch suffix cannot be empty".into());
+        }
+
+        self.ensure_base_worktree(base_branch)?;
+
+        let branch_name = format!("{}/{}", self.git_helper_config().branch_prefix, suffix);
+        git::create_branch(std::path::Path::new("."), &branch_name, base_branch)
+            .map_err(|err| err.to_string())?;
+        git::switch_branch(std::path::Path::new("."), &branch_name).map_err(|err| err.to_string())?;
+
+        let git_dir = git::get_git_dir(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+        let mut state = load_repo_state(&git_dir).map_err(|err| err.to_string())?;
+        state.set_branch_origin(&branch_name, base_branch);
+        save_repo_state(&git_dir, &state).map_err(|err| err.to_string())?;
+
+        self.view.refresh();
+        Ok(())
+    }
+
+    fn switch_branch(&mut self, branch: &str) -> Result<(), String> {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return Err("Branch name cannot be empty".into());
+        }
+
+        if git::is_dirty(std::path::Path::new(".")) {
+            let current = git::get_current_branch(std::path::Path::new("."))
+                .unwrap_or_else(|| "detached".into());
+            let message = format!(
+                "{}: {} -> {}",
+                self.git_helper_config().stash_message_prefix,
+                current,
+                branch
+            );
+            git::stash_push(std::path::Path::new("."), &message).map_err(|err| err.to_string())?;
+        }
+
+        git::switch_branch(std::path::Path::new("."), branch).map_err(|err| err.to_string())?;
+        self.view.refresh();
+        Ok(())
+    }
+
+    fn commit_changes(&mut self, message: &str) -> Result<(), String> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("Commit message cannot be empty".into());
+        }
+        git::commit(std::path::Path::new("."), message).map_err(|err| err.to_string())?;
+        self.view.refresh();
+        Ok(())
+    }
+
+    fn push_current_branch(&mut self) {
+        let result = (|| -> Result<(), String> {
+            let branch = git::get_current_branch(std::path::Path::new("."))
+                .ok_or_else(|| "Not on a branch".to_string())?;
+            let set_upstream = git::get_upstream_branch(std::path::Path::new(".")).is_none()
+                && self.git_helper_config().auto_set_upstream_on_first_push;
+            git::push(std::path::Path::new("."), "origin", &branch, set_upstream)
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.view.refresh(),
+            Err(err) => self.error_notification(err),
+        }
+    }
+
+    fn merge_base_into_current(&mut self) {
+        let result = (|| -> Result<(), String> {
+            if git::is_dirty(std::path::Path::new(".")) {
+                return Err("Worktree is dirty; stash or commit before merging base".into());
+            }
+
+            let branch = git::get_current_branch(std::path::Path::new("."))
+                .ok_or_else(|| "Not on a branch".to_string())?;
+            let git_dir = git::get_git_dir(std::path::Path::new("."))
+                .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+            let state = load_repo_state(&git_dir).map_err(|err| err.to_string())?;
+            let base_branch = state
+                .get_branch_origin(&branch)
+                .ok_or_else(|| format!("No base branch recorded for '{branch}'"))?
+                .to_string();
+
+            self.ensure_base_worktree(&base_branch)?;
+            git::merge_base_into_current(std::path::Path::new("."), &base_branch)
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.view.refresh(),
+            Err(err) => self.error_notification(err),
+        }
+    }
+
+    fn install_hook(&mut self) {
+        let result = (|| -> Result<(), String> {
+            let git_dir = git::get_git_dir(std::path::Path::new("."))
+                .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+            protection::install_or_update_pre_commit_hook(&git_dir, self.git_helper_config())
+                .map_err(|err| err.to_string())
+        })();
+
+        match result {
+            Ok(()) => self.success_notification("Installed lil-big-helper pre-commit hook".into()),
+            Err(err) => self.error_notification(err),
+        }
+    }
+
     fn update_state(&mut self, view_area: Rect) {
         self.app_status.view_area = view_area;
     }

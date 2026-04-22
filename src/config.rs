@@ -17,9 +17,9 @@ use crate::{
 
 const XDG_CONFIG_HOME_ENV_NAME: &str = "XDG_CONFIG_HOME";
 const DEFAULT_CONFIG_DIR: &str = ".config";
-const APP_DIR_NAME: &str = "serie";
+const APP_DIR_NAME: &str = "lil-big-helper";
 const CONFIG_FILE_NAME: &str = "config.toml";
-const CONFIG_FILE_ENV_NAME: &str = "SERIE_CONFIG_FILE";
+const CONFIG_FILE_ENV_NAME: &str = "LIL_BIG_HELPER_CONFIG_FILE";
 
 pub fn load() -> Result<(
     CoreConfig,
@@ -86,19 +86,19 @@ fn read_config_from_path(path: &Path) -> Result<Config> {
 struct Config {
     #[garde(dive)]
     #[nested]
-    core: CoreConfig,
+    pub core: CoreConfig,
     #[garde(dive)]
     #[nested]
-    ui: UiConfig,
+    pub ui: UiConfig,
     #[garde(dive)]
     #[nested]
-    graph: GraphConfig,
+    pub graph: GraphConfig,
     #[garde(skip)]
     #[nested]
-    color: ColorTheme,
+    pub color: ColorTheme,
     // The user customed keybinds, please ref `assets/default-keybind.toml`
     #[garde(skip)]
-    keybind: Option<KeyBind>,
+    pub keybind: Option<KeyBind>,
 }
 
 #[optional(derives = [Deserialize])]
@@ -116,6 +116,39 @@ pub struct CoreConfig {
     #[garde(dive)]
     #[nested]
     pub external: CoreExternalConfig,
+    #[garde(dive)]
+    #[nested]
+    pub git_helper: GitHelperConfig,
+}
+
+#[optional(derives = [Deserialize])]
+#[derive(Debug, Clone, PartialEq, Eq, SmartDefault, Validate)]
+pub struct GitHelperConfig {
+    #[garde(length(min = 1))]
+    #[default(vec!["main".into()])]
+    pub protected_base_branches: Vec<String>,
+    #[garde(length(min = 1))]
+    #[default = "feature"]
+    pub branch_prefix: String,
+    #[garde(custom(validate_relative_path))]
+    #[default(PathBuf::from(".lbh/worktrees"))]
+    pub hidden_worktree_dir: PathBuf,
+    #[garde(skip)]
+    #[default = true]
+    pub install_protection_hook: bool,
+    #[garde(skip)]
+    #[default = true]
+    pub auto_set_upstream_on_first_push: bool,
+    #[garde(length(min = 1))]
+    #[default = "lbh:auto-switch"]
+    pub stash_message_prefix: String,
+}
+
+fn validate_relative_path(path: &PathBuf, _: &()) -> garde::Result {
+    if path.is_absolute() {
+        return Err(garde::Error::new("path must be relative"));
+    }
+    Ok(())
 }
 
 #[optional(derives = [Deserialize])]
@@ -451,6 +484,14 @@ mod tests {
                 external: CoreExternalConfig {
                     clipboard: ClipboardConfig::Auto,
                 },
+                git_helper: GitHelperConfig {
+                    protected_base_branches: vec!["main".into()],
+                    branch_prefix: "feature".into(),
+                    hidden_worktree_dir: PathBuf::from(".lbh/worktrees"),
+                    install_protection_hook: true,
+                    auto_set_upstream_on_first_push: true,
+                    stash_message_prefix: "lbh:auto-switch".into(),
+                },
             },
             ui: UiConfig {
                 common: UiCommonConfig {
@@ -517,6 +558,13 @@ mod tests {
             commands_10 = { name = "echo world", type = "inline", commands = ["echo", "world"], refresh = false }
             commands_3 = { name = "open vim", type = "suspend", commands = ["vim"] }
             tab_width = 2
+            [core.git_helper]
+            protected_base_branches = ["dev", "main"]
+            branch_prefix = "game"
+            hidden_worktree_dir = ".helper/worktrees"
+            install_protection_hook = false
+            auto_set_upstream_on_first_push = false
+            stash_message_prefix = "custom-stash"
             [ui.common]
             cursor_type = { Virtual = "|" }
             [ui.list]
@@ -602,6 +650,14 @@ mod tests {
                 external: CoreExternalConfig {
                     clipboard: ClipboardConfig::Auto,
                 },
+                git_helper: GitHelperConfig {
+                    protected_base_branches: vec!["dev".into(), "main".into()],
+                    branch_prefix: "game".into(),
+                    hidden_worktree_dir: PathBuf::from(".helper/worktrees"),
+                    install_protection_hook: false,
+                    auto_set_upstream_on_first_push: false,
+                    stash_message_prefix: "custom-stash".into(),
+                },
             },
             ui: UiConfig {
                 common: UiCommonConfig {
@@ -682,6 +738,14 @@ mod tests {
                 },
                 external: CoreExternalConfig {
                     clipboard: ClipboardConfig::Auto,
+                },
+                git_helper: GitHelperConfig {
+                    protected_base_branches: vec!["main".into()],
+                    branch_prefix: "feature".into(),
+                    hidden_worktree_dir: PathBuf::from(".lbh/worktrees"),
+                    install_protection_hook: true,
+                    auto_set_upstream_on_first_push: true,
+                    stash_message_prefix: "lbh:auto-switch".into(),
                 },
             },
             ui: UiConfig {

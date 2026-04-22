@@ -9,6 +9,8 @@ mod check;
 mod event;
 mod external;
 mod keybind;
+mod protection;
+mod repo_state;
 mod view;
 mod widget;
 
@@ -19,7 +21,7 @@ use clap::{Parser, ValueEnum};
 use graph::GraphImageManager;
 use serde::Deserialize;
 
-/// Serie - A rich git commit graph in your terminal, like magic 📚
+/// lil-big-helper - A git helper with a rich commit graph in your terminal
 #[derive(Parser)]
 #[command(version)]
 struct Args {

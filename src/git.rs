@@ -587,29 +587,216 @@ fn parse_tag_refs(hash: &str, refs: &str) -> Option<Ref> {
     }
 }
 
-fn get_current_branch(path: &Path) -> Option<String> {
-    let mut cmd = Command::new("git")
-        .arg("branch")
-        .arg("--show-current")
+pub fn get_current_branch(path: &Path) -> Option<String> {
+    git_stdout(
+        Command::new("git")
+            .arg("branch")
+            .arg("--show-current")
+            .current_dir(path),
+    )
+}
+
+pub fn is_dirty(path: &Path) -> bool {
+    !git_stdout(
+        Command::new("git")
+            .arg("status")
+            .arg("--short")
+            .current_dir(path),
+    )
+    .unwrap_or_default()
+    .is_empty()
+}
+
+pub fn has_staged_changes(path: &Path) -> bool {
+    let status = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .arg("--exit-code")
         .current_dir(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .status()
         .unwrap();
+    !status.success()
+}
 
-    let stdout = cmd.stdout.take().expect("failed to open stdout");
+pub fn get_upstream_branch(path: &Path) -> Option<String> {
+    git_stdout(
+        Command::new("git")
+            .arg("rev-parse")
+            .arg("--abbrev-ref")
+            .arg("--symbolic-full-name")
+            .arg("@{upstream}")
+            .current_dir(path),
+    )
+}
 
-    let reader = BufReader::new(stdout);
+pub fn get_repo_root(path: &Path) -> Option<PathBuf> {
+    git_stdout(
+        Command::new("git")
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .current_dir(path),
+    )
+    .map(PathBuf::from)
+}
 
-    let branch = if let Some(line) = reader.lines().next() {
-        line.ok()
-    } else {
+pub fn get_git_dir(path: &Path) -> Option<PathBuf> {
+    git_stdout(
+        Command::new("git")
+            .arg("rev-parse")
+            .arg("--absolute-git-dir")
+            .current_dir(path),
+    )
+    .map(PathBuf::from)
+}
+
+pub fn get_local_branches(path: &Path) -> Vec<String> {
+    git_lines(
+        Command::new("git")
+            .arg("for-each-ref")
+            .arg("--format=%(refname:short)")
+            .arg("refs/heads")
+            .current_dir(path),
+    )
+}
+
+pub fn add_hidden_base_worktree(path: &Path, worktree_path: &Path, base: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg("-B")
+            .arg(base)
+            .arg(worktree_path)
+            .arg(base)
+            .current_dir(path),
+    )
+}
+
+pub fn remove_hidden_base_worktree(path: &Path, worktree_path: &Path) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(worktree_path)
+            .current_dir(path),
+    )
+}
+
+pub fn create_branch(path: &Path, branch: &str, start_point: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("branch")
+            .arg(branch)
+            .arg(start_point)
+            .current_dir(path),
+    )
+}
+
+pub fn switch_branch(path: &Path, branch: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("switch")
+            .arg(branch)
+            .current_dir(path),
+    )
+}
+
+pub fn stash_push(path: &Path, message: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("stash")
+            .arg("push")
+            .arg("-u")
+            .arg("-m")
+            .arg(message)
+            .current_dir(path),
+    )
+}
+
+pub fn refresh_hidden_base_worktree(worktree_path: &Path, base: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("fetch")
+            .arg("origin")
+            .current_dir(worktree_path),
+    )?;
+
+    run_git(
+        Command::new("git")
+            .arg("merge")
+            .arg("--ff-only")
+            .arg(format!("origin/{base}"))
+            .current_dir(worktree_path),
+    )
+}
+
+pub fn commit(path: &Path, message: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("commit")
+            .arg("-m")
+            .arg(message)
+            .current_dir(path),
+    )
+}
+
+pub fn push(path: &Path, remote: &str, branch: &str, set_upstream: bool) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("push");
+    if set_upstream {
+        cmd.arg("--set-upstream");
+    }
+    cmd.arg(remote).arg(branch).current_dir(path);
+    run_git(&mut cmd)
+}
+
+pub fn merge_base_into_current(path: &Path, base: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("merge")
+            .arg("--no-edit")
+            .arg(base)
+            .current_dir(path),
+    )
+}
+
+fn git_stdout(cmd: &mut Command) -> Option<String> {
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
         None
-    };
+    } else {
+        Some(stdout)
+    }
+}
 
-    cmd.wait().unwrap();
+fn git_lines(cmd: &mut Command) -> Vec<String> {
+    git_stdout(cmd)
+        .map(|stdout| stdout.lines().map(|line| line.to_string()).collect())
+        .unwrap_or_default()
+}
 
-    branch
+fn run_git(cmd: &mut Command) -> Result<()> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+
+    if message.is_empty() {
+        Err("git command failed".into())
+    } else {
+        Err(message.into())
+    }
 }
 
 #[derive(Debug)]

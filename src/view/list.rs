@@ -63,6 +63,27 @@ impl<'a> ListView<'a> {
                 UserEvent::Quit => {
                     self.tx.send(AppEvent::Quit);
                 }
+                UserEvent::ActionMenu => {
+                    self.tx.send(AppEvent::OpenActionMenu);
+                }
+                UserEvent::CreateBranch => {
+                    self.tx.send(AppEvent::OpenCreateBranchPrompt);
+                }
+                UserEvent::SwitchBranch => {
+                    self.tx.send(AppEvent::OpenSwitchBranchPrompt);
+                }
+                UserEvent::CommitCreate => {
+                    self.tx.send(AppEvent::OpenCommitPrompt);
+                }
+                UserEvent::PushCurrent => {
+                    self.tx.send(AppEvent::PushCurrentBranch);
+                }
+                UserEvent::MergeBase => {
+                    self.tx.send(AppEvent::MergeBaseIntoCurrent);
+                }
+                UserEvent::InstallHook => {
+                    self.tx.send(AppEvent::InstallHook);
+                }
                 UserEvent::NavigateDown | UserEvent::SelectDown => {
                     for _ in 0..count {
                         self.as_mut_list_state().select_next();

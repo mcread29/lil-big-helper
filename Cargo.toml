@@ -1,10 +1,10 @@
 [package]
-name = "serie"
+name = "lil-big-helper"
 version = "0.7.2"
 description = "A rich git commit graph in your terminal, like magic"
 authors = ["Kyosuke Fujimoto <kyoro.f@gmail.com>"]
-homepage = "https://github.com/lusingander/serie"
-repository = "https://github.com/lusingander/serie"
+homepage = "https://github.com/lusingander/lil-big-helper"
+repository = "https://github.com/lusingander/lil-big-helper"
 readme = "README.md"
 license = "MIT"
 keywords = ["git", "cli", "tui", "terminal"]
@@ -13,6 +13,17 @@ edition = "2021"
 rust-version = "1.88.0"
 
 exclude = ["/.github", "/img"]
+
+[lib]
+name = "serie"
+
+[[bin]]
+name = "lil-big-helper"
+path = "src/main.rs"
+
+[[bin]]
+name = "lbh"
+path = "src/main.rs"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
@@ -30,6 +41,7 @@ ratatui = { version = "0.30.0", features = ["serde"] }
 rustc-hash = "2.1.2"
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 smart-default = "0.7.1"
 toml = "1.1.2"
 tui-input = "0.15.1"

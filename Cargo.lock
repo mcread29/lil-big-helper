@@ -1119,6 +1119,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
+name = "lil-big-helper"
+version = "0.7.2"
+dependencies = [
+ "ansi-to-tui",
+ "arboard",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "console",
+ "dircpy",
+ "fuzzy-matcher",
+ "garde",
+ "image",
+ "laurier",
+ "once_cell",
+ "ratatui",
+ "rstest",
+ "rustc-hash",
+ "semver",
+ "serde",
+ "serde_json",
+ "smart-default",
+ "tempfile",
+ "text-to-png",
+ "toml",
+ "tui-input",
+ "tui-tree-widget",
+ "umbra",
+]
+
+[[package]]
 name = "line-clipping"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,42 +2085,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.149"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "serie"
-version = "0.7.2"
-dependencies = [
- "ansi-to-tui",
- "arboard",
- "base64 0.22.1",
- "chrono",
- "clap",
- "console",
- "dircpy",
- "fuzzy-matcher",
- "garde",
- "image",
- "laurier",
- "once_cell",
- "ratatui",
- "rstest",
- "rustc-hash",
- "semver",
- "serde",
- "smart-default",
- "tempfile",
- "text-to-png",
- "toml",
- "tui-input",
- "tui-tree-widget",
- "umbra",
 ]
 
 [[package]]
@@ -3334,6 +3348,12 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "zmij"
+version = "1.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zune-core"

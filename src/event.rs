@@ -20,6 +20,10 @@ pub enum AppEvent {
     Key(KeyEvent),
     Resize(usize, usize),
     Quit,
+    OpenActionMenu,
+    OpenCreateBranchPrompt,
+    OpenSwitchBranchPrompt,
+    OpenCommitPrompt,
     OpenDetail,
     CloseDetail,
     OpenUserCommand(usize),
@@ -39,6 +43,9 @@ pub enum AppEvent {
     NotifySuccess(String),
     NotifyWarn(String),
     NotifyError(String),
+    PushCurrentBranch,
+    MergeBaseIntoCurrent,
+    InstallHook,
 }
 
 #[derive(Clone)]
@@ -187,6 +194,13 @@ impl EventController {
 pub enum UserEvent {
     ForceQuit,
     Quit,
+    ActionMenu,
+    CreateBranch,
+    SwitchBranch,
+    CommitCreate,
+    PushCurrent,
+    MergeBase,
+    InstallHook,
     HelpToggle,
     Cancel,
     Close,
@@ -251,6 +265,13 @@ impl<'de> Deserialize<'de> for UserEvent {
                     match value {
                         "force_quit" => Ok(UserEvent::ForceQuit),
                         "quit" => Ok(UserEvent::Quit),
+                        "action_menu" => Ok(UserEvent::ActionMenu),
+                        "create_branch" => Ok(UserEvent::CreateBranch),
+                        "switch_branch" => Ok(UserEvent::SwitchBranch),
+                        "commit_create" => Ok(UserEvent::CommitCreate),
+                        "push_current" => Ok(UserEvent::PushCurrent),
+                        "merge_base" => Ok(UserEvent::MergeBase),
+                        "install_hook" => Ok(UserEvent::InstallHook),
                         "help_toggle" => Ok(UserEvent::HelpToggle),
                         "cancel" => Ok(UserEvent::Cancel),
                         "close" => Ok(UserEvent::Close),
