@@ -51,6 +51,13 @@ impl<'a> View<'a> {
         }
     }
 
+    pub fn captures_text_input(&self) -> bool {
+        match self {
+            View::Status(view) => view.captures_text_input(),
+            _ => false,
+        }
+    }
+
     pub fn of_list(
         commit_list_state: CommitListState<'a>,
         ctx: Rc<AppContext>,

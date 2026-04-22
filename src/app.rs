@@ -199,6 +199,29 @@ impl App<'_> {
 
                     let user_event = self.ctx.keybind.get(&key);
 
+                    if self.view.captures_text_input() {
+                        match user_event {
+                            Some(UserEvent::ForceQuit) => {
+                                self.ec.send(AppEvent::Quit);
+                            }
+                            Some(UserEvent::StatusCommit) => {
+                                self.app_status.numeric_prefix.clear();
+                                self.view.handle_event(
+                                    UserEventWithCount::from_event(UserEvent::StatusCommit),
+                                    key,
+                                );
+                            }
+                            _ => {
+                                self.app_status.numeric_prefix.clear();
+                                self.view.handle_event(
+                                    UserEventWithCount::from_event(UserEvent::Unknown),
+                                    key,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     if let Some(UserEvent::Cancel) = user_event {
                         if !self.app_status.numeric_prefix.is_empty() {
                             // Clear numeric prefix and cancel the event

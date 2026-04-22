@@ -1,14 +1,14 @@
 use std::{cmp::min, collections::BTreeMap, path::Path, rc::Rc};
 
 use ratatui::{
-    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
     text::Line,
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
-use tui_input::{backend::crossterm::EventHandler, Input};
+use ratatui_textarea::TextArea;
 
 use crate::{
     app::AppContext,
@@ -53,8 +53,8 @@ struct StatusUiState {
     file_offset: usize,
     diff_offset: usize,
     focus: FocusArea,
-    title: Input,
-    description: Input,
+    title: TextArea<'static>,
+    description: TextArea<'static>,
 }
 
 #[derive(Debug)]
@@ -82,19 +82,37 @@ impl<'a> StatusView<'a> {
             tree_rows: Vec::new(),
             selected_row: 0,
             diff_lines: Vec::new(),
-            ui: StatusUiState {
-                focus: FocusArea::Files,
-                ..StatusUiState::default()
-            },
+            ui: StatusUiState::default(),
             ctx,
             tx,
         };
+        view.ui.focus = FocusArea::Files;
+        view.ui.title.set_placeholder_text("Commit title");
+        view.ui
+            .description
+            .set_placeholder_text("Commit description");
+        view.ui.title.set_cursor_style(
+            Style::default()
+                .fg(view.ctx.color_theme.ref_selected_fg)
+                .bg(view.ctx.color_theme.ref_selected_bg),
+        );
+        view.ui.description.set_cursor_style(
+            Style::default()
+                .fg(view.ctx.color_theme.ref_selected_fg)
+                .bg(view.ctx.color_theme.ref_selected_bg),
+        );
         view.rebuild_tree_rows();
         view.refresh_diff();
         view
     }
 
     pub fn handle_event(&mut self, event_with_count: UserEventWithCount, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Esc)
+            && matches!(self.ui.focus, FocusArea::Title | FocusArea::Description)
+        {
+            self.ui.focus = FocusArea::Files;
+            return;
+        }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.cycle_focus(matches!(key.code, KeyCode::BackTab));
             return;
@@ -130,6 +148,10 @@ impl<'a> StatusView<'a> {
 
     pub fn as_list_state(&self) -> &CommitListState<'a> {
         self.commit_list_state.as_ref().unwrap()
+    }
+
+    pub fn captures_text_input(&self) -> bool {
+        matches!(self.ui.focus, FocusArea::Title | FocusArea::Description)
     }
 
     pub fn reset_status_with(&mut self, ctx: StatusRefreshViewContext) {
@@ -201,8 +223,7 @@ impl<'a> StatusView<'a> {
                 }
                 _ => {}
             },
-            FocusArea::Title => Self::handle_text_input(&mut self.ui.title, key),
-            FocusArea::Description => Self::handle_text_input(&mut self.ui.description, key),
+            FocusArea::Title | FocusArea::Description => self.handle_text_input(key),
             FocusArea::Button => {
                 if matches!(
                     event_with_count.event,
@@ -214,11 +235,20 @@ impl<'a> StatusView<'a> {
         }
     }
 
-    fn handle_text_input(input: &mut Input, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return;
+    fn handle_text_input(&mut self, key: KeyEvent) {
+        match self.ui.focus {
+            FocusArea::Title => {
+                if matches!(key.code, KeyCode::Enter) && key.modifiers == KeyModifiers::NONE {
+                    self.ui.focus = FocusArea::Description;
+                } else {
+                    self.ui.title.input(key);
+                }
+            }
+            FocusArea::Description => {
+                self.ui.description.input(key);
+            }
+            _ => {}
         }
-        input.handle_event(&Event::Key(key));
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
@@ -341,10 +371,10 @@ impl<'a> StatusView<'a> {
         f.render_widget(paragraph, area);
     }
 
-    fn render_commit_form(&self, f: &mut Frame, area: Rect) {
+    fn render_commit_form(&mut self, f: &mut Frame, area: Rect) {
         let [title_area, desc_area, button_area] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(3),
         ])
         .areas(area);
@@ -352,24 +382,6 @@ impl<'a> StatusView<'a> {
             git::get_current_branch(Path::new(".")).unwrap_or_else(|| "detached".into());
         let (base_branch, prefix) = repo_status_metadata(&self.ctx);
 
-        let title_label = format!(
-            "Title{}: {}",
-            if self.ui.focus == FocusArea::Title {
-                " *"
-            } else {
-                ""
-            },
-            self.ui.title.value()
-        );
-        let desc_label = format!(
-            "Desc{}: {}",
-            if self.ui.focus == FocusArea::Description {
-                " *"
-            } else {
-                ""
-            },
-            self.ui.description.value()
-        );
         let button_label = if self.ui.focus == FocusArea::Button {
             "[ Commit ]"
         } else {
@@ -380,25 +392,29 @@ impl<'a> StatusView<'a> {
         let header = format!(
             "Commit  branch:{current_branch}  base:{base_branch}  prefix:{prefix}  staged:{staged_count}  x discards"
         );
-        f.render_widget(
-            Paragraph::new(Line::raw(title_label)).block(
-                Block::default()
-                    .title(header)
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                    .padding(Padding::horizontal(1)),
-            ),
-            title_area,
+        let title_focused = self.ui.focus == FocusArea::Title;
+        let desc_focused = self.ui.focus == FocusArea::Description;
+        self.ui.title.set_block(
+            Block::default()
+                .title(header)
+                .title_bottom(if title_focused { "Title *" } else { "Title" })
+                .borders(Borders::ALL)
+                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
+                .padding(Padding::horizontal(1)),
         );
-        f.render_widget(
-            Paragraph::new(Line::raw(desc_label)).block(
-                Block::default()
-                    .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-                    .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                    .padding(Padding::horizontal(1)),
-            ),
-            desc_area,
+        self.ui.description.set_block(
+            Block::default()
+                .title_bottom(if desc_focused {
+                    "Description *"
+                } else {
+                    "Description"
+                })
+                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
+                .padding(Padding::horizontal(1)),
         );
+        f.render_widget(&self.ui.title, title_area);
+        f.render_widget(&self.ui.description, desc_area);
 
         let button_line = if self.ui.focus == FocusArea::Button {
             Line::raw(button_label)
@@ -521,14 +537,22 @@ impl<'a> StatusView<'a> {
             return;
         }
 
-        let title = self.ui.title.value().trim();
+        let title = self
+            .ui
+            .title
+            .lines()
+            .first()
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
         if title.is_empty() {
             self.tx
                 .send(AppEvent::NotifyError("Commit title cannot be empty".into()));
             return;
         }
 
-        let desc = self.ui.description.value().trim();
+        let desc_text = self.ui.description.lines().join("\n");
+        let desc = desc_text.trim();
         let message = if desc.is_empty() {
             title.to_string()
         } else {
