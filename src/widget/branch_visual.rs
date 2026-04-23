@@ -77,6 +77,17 @@ impl BranchVisuals {
 
     pub fn display_label(&self, reference: &Ref, shorten: bool) -> String {
         match reference {
+            Ref::Branch { .. } => self.display_text(reference, shorten),
+            Ref::RemoteBranch { .. } => {
+                let label = self.display_text(reference, shorten);
+                format!("{REMOTE_ICON}{label}")
+            }
+            Ref::Tag { name, .. } | Ref::Stash { name, .. } => name.clone(),
+        }
+    }
+
+    pub fn display_text(&self, reference: &Ref, shorten: bool) -> String {
+        match reference {
             Ref::Branch { name, .. } => {
                 if shorten {
                     final_branch_segment(name).to_string()
@@ -86,12 +97,11 @@ impl BranchVisuals {
             }
             Ref::RemoteBranch { name, .. } => {
                 let branch_name = strip_remote_prefix(name);
-                let label = if shorten {
-                    final_branch_segment(branch_name)
+                if shorten {
+                    final_branch_segment(branch_name).to_string()
                 } else {
-                    branch_name
-                };
-                format!("{REMOTE_ICON}{label}")
+                    branch_name.to_string()
+                }
             }
             Ref::Tag { name, .. } | Ref::Stash { name, .. } => name.clone(),
         }
@@ -174,7 +184,9 @@ mod tests {
         };
 
         assert_eq!(visuals.display_label(&branch, true), "audio-feedback");
+        assert_eq!(visuals.display_text(&branch, true), "audio-feedback");
         assert_eq!(visuals.display_label(&remote, true), "☁ audio-feedback");
+        assert_eq!(visuals.display_text(&remote, true), "audio-feedback");
     }
 
     #[test]
