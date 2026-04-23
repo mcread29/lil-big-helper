@@ -443,9 +443,9 @@ fn tree_item_color(
     kind: TreeNodeKind,
 ) -> Color {
     match kind {
-        TreeNodeKind::Branch | TreeNodeKind::RemoteBranch => {
-            branch_visuals.color_for_name(identifier)
-        }
+        TreeNodeKind::Branch => branch_visuals.color_for_name(identifier),
+        TreeNodeKind::RemoteBranch if identifier.contains('/') => branch_visuals.color_for_name(identifier),
+        TreeNodeKind::RemoteBranch => color_theme.fg,
         TreeNodeKind::Other => color_theme.fg,
     }
 }
