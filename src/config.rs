@@ -352,8 +352,6 @@ pub struct UiListConfig {
         UserListColumnType::Status,
         UserListColumnType::Subject,
         UserListColumnType::Name,
-        UserListColumnType::Hash,
-        UserListColumnType::Date,
     ])]
     pub columns: Vec<UserListColumnType>,
     #[garde(range(min = 1))]
@@ -506,8 +504,6 @@ mod tests {
                         UserListColumnType::Status,
                         UserListColumnType::Subject,
                         UserListColumnType::Name,
-                        UserListColumnType::Hash,
-                        UserListColumnType::Date,
                     ],
                     subject_min_width: 20,
                     date_format: "%Y-%m-%d".into(),
@@ -762,8 +758,6 @@ mod tests {
                         UserListColumnType::Status,
                         UserListColumnType::Subject,
                         UserListColumnType::Name,
-                        UserListColumnType::Hash,
-                        UserListColumnType::Date,
                     ],
                     subject_min_width: 20,
                     date_format: "%Y/%m/%d".into(),

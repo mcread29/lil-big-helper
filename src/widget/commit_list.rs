@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{Event, KeyEvent},
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{List, ListItem, StatefulWidget, Widget},
@@ -693,17 +693,18 @@ impl<'a> StatefulWidget for CommitList<'a> {
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         self.update_state(area, state);
 
+        let columns = visible_columns(&self.ctx.ui_config.list.columns);
         let constraints = calc_cell_widths(
             area.width,
             self.ctx.ui_config.list.subject_min_width,
             state.graph_area_cell_width(),
             self.ctx.ui_config.list.name_width,
             self.ctx.ui_config.list.date_width,
-            &self.ctx.ui_config.list.columns,
+            &columns,
         );
         let chunks = Layout::horizontal(constraints).split(area);
 
-        for (i, col) in self.ctx.ui_config.list.columns.iter().enumerate() {
+        for (i, col) in columns.iter().enumerate() {
             match col {
                 UserListColumnType::Graph => {
                     self.render_graph(buf, chunks[i], state);
@@ -721,10 +722,10 @@ impl<'a> StatefulWidget for CommitList<'a> {
                     self.render_name(buf, chunks[i], state);
                 }
                 UserListColumnType::Hash => {
-                    self.render_hash(buf, chunks[i], state);
+                    continue;
                 }
                 UserListColumnType::Date => {
-                    self.render_date(buf, chunks[i], state);
+                    continue;
                 }
             }
         }
@@ -857,74 +858,28 @@ impl CommitList<'_> {
                 } else {
                     commit.author_name.to_string()
                 };
-                let spans =
+                let color = author_color(commit);
+                let name_width = console::measure_text_width(&name);
+                let pad_width = max_width.saturating_sub(name_width);
+                let mut spans = Vec::new();
+                if pad_width > 0 {
+                    spans.push(Span::raw(" ".repeat(pad_width)));
+                }
+                let name_spans =
                     if let Some(pos) = state.search_matches[state.offset + i].author_name.clone() {
                         highlighted_spans(
                             name.into(),
                             pos,
-                            author_color(commit),
+                            color,
                             Modifier::empty(),
                             &self.ctx.color_theme,
                             truncate,
                         )
                     } else {
-                        vec![name.fg(author_color(commit))]
+                        vec![name.fg(color)]
                     };
-                self.to_commit_list_item(i, spans, state)
-            })
-            .collect();
-        Widget::render(List::new(items), area, buf);
-    }
-
-    fn render_hash(&self, buf: &mut Buffer, area: Rect, state: &CommitListState) {
-        if area.is_empty() {
-            return;
-        }
-        let items: Vec<ListItem> = self
-            .rendering_commit_iter(state)
-            .map(|(i, commit)| {
-                let hash = commit.commit_hash.as_short_hash();
-                let spans =
-                    if let Some(pos) = state.search_matches[state.offset + i].commit_hash.clone() {
-                        highlighted_spans(
-                            hash.into(),
-                            pos,
-                            state.commits[state.offset + i].graph_color,
-                            Modifier::empty(),
-                            &self.ctx.color_theme,
-                            false,
-                        )
-                    } else {
-                        vec![hash.fg(state.commits[state.offset + i].graph_color)]
-                    };
-                self.to_commit_list_item(i, spans, state)
-            })
-            .collect();
-        Widget::render(List::new(items), area, buf);
-    }
-
-    fn render_date(&self, buf: &mut Buffer, area: Rect, state: &CommitListState) {
-        if area.is_empty() {
-            return;
-        }
-        let items: Vec<ListItem> = self
-            .rendering_commit_iter(state)
-            .map(|(i, commit)| {
-                let date = &commit.author_date;
-                let date_str = if self.ctx.ui_config.list.date_local {
-                    let local = date.with_timezone(&chrono::Local);
-                    local
-                        .format(&self.ctx.ui_config.list.date_format)
-                        .to_string()
-                } else {
-                    date.format(&self.ctx.ui_config.list.date_format)
-                        .to_string()
-                };
-                self.to_commit_list_item(
-                    i,
-                    vec![date_str.fg(self.ctx.color_theme.list_date_fg)],
-                    state,
-                )
+                spans.extend(name_spans);
+                self.to_commit_list_item_with_alignment(i, spans, state, Alignment::Right)
             })
             .collect();
         Widget::render(List::new(items), area, buf);
@@ -956,10 +911,20 @@ impl CommitList<'_> {
         spans: Vec<Span<'a>>,
         state: &'b CommitListState,
     ) -> ListItem<'a> {
+        self.to_commit_list_item_with_alignment(i, spans, state, Alignment::Left)
+    }
+
+    fn to_commit_list_item_with_alignment<'a, 'b>(
+        &'b self,
+        i: usize,
+        spans: Vec<Span<'a>>,
+        state: &'b CommitListState,
+        alignment: Alignment,
+    ) -> ListItem<'a> {
         let mut spans = spans;
         spans.insert(0, Span::raw(" "));
         spans.push(Span::raw(" "));
-        let mut line = Line::from(spans);
+        let mut line = Line::from(spans).alignment(alignment);
         if i == state.selected {
             line = line
                 .bg(self.ctx.color_theme.list_selected_bg)
@@ -1000,7 +965,6 @@ fn status_spans<'a>(
                     refs_matches.get(name),
                     fg,
                     color_theme,
-                    branch_visuals,
                 ),
                 _ => refs_matches
                     .get(name)
@@ -1080,9 +1044,7 @@ fn display_branch_ref_spans(
     pos: Option<&SearchMatchPosition>,
     fg: Color,
     color_theme: &ColorTheme,
-    branch_visuals: &BranchVisuals,
 ) -> Vec<Span<'static>> {
-    let display_label = branch_visuals.display_label(reference, true);
     let (prefix, visible_name) = match reference {
         Ref::RemoteBranch { .. } => ("☁ ", last_segment_after_remote(full_name)),
         Ref::Branch { .. } => ("", final_segment(full_name)),
@@ -1106,7 +1068,7 @@ fn display_branch_ref_spans(
                 false,
             )
         })
-        .unwrap_or_else(|| vec![Span::raw(display_label).fg(fg).bold()]);
+        .unwrap_or_else(|| vec![Span::raw(visible_name.to_string()).fg(fg).bold()]);
     spans.extend(visible_spans);
     spans
 }
@@ -1170,7 +1132,7 @@ fn calc_cell_widths(
     subject_min_width: u16,
     graph_width: u16,
     name_width: u16,
-    date_width: u16,
+    _date_width: u16,
     columns: &[UserListColumnType],
 ) -> Vec<Constraint> {
     let pad = 2;
@@ -1198,10 +1160,10 @@ fn calc_cell_widths(
                 name_cell_width = name_width + pad;
             }
             UserListColumnType::Hash => {
-                hash_cell_width = 7 + pad;
+                hash_cell_width = 0;
             }
             UserListColumnType::Date => {
-                date_cell_width = date_width + pad;
+                date_cell_width = 0;
             }
             UserListColumnType::Subject => {}
         }
@@ -1260,6 +1222,14 @@ fn calc_cell_widths(
     constraints
 }
 
+fn visible_columns(columns: &[UserListColumnType]) -> Vec<UserListColumnType> {
+    columns
+        .iter()
+        .filter(|column| !matches!(column, UserListColumnType::Hash | UserListColumnType::Date))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,6 +1241,47 @@ mod tests {
             .expect("suffix match should be preserved");
 
         assert_eq!(display.matched_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn remote_branch_spans_render_single_cloud_icon() {
+        let reference = Ref::RemoteBranch {
+            name: "origin/mason/audio-feedback".into(),
+            target: CommitHash::from("abc1234"),
+        };
+        let theme = ColorTheme::default();
+
+        let spans = display_branch_ref_spans(
+            &reference,
+            "origin/mason/audio-feedback",
+            None,
+            Color::Blue,
+            &theme,
+        );
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "☁ ");
+        assert_eq!(spans[1].content.as_ref(), "audio-feedback");
+    }
+
+    #[test]
+    fn visible_columns_filters_hash_and_date() {
+        let columns = vec![
+            UserListColumnType::Graph,
+            UserListColumnType::Hash,
+            UserListColumnType::Subject,
+            UserListColumnType::Date,
+            UserListColumnType::Name,
+        ];
+
+        assert_eq!(
+            visible_columns(&columns),
+            vec![
+                UserListColumnType::Graph,
+                UserListColumnType::Subject,
+                UserListColumnType::Name,
+            ]
+        );
     }
 
     #[test]
@@ -1300,13 +1311,13 @@ mod tests {
         );
 
         let expected = vec![
-            Constraint::Length(6),  // Graph
-            Constraint::Length(1),  // Marker
-            Constraint::Length(15), // Status
-            Constraint::Min(0),     // Subject
-            Constraint::Length(12), // Name (10 + 2 pad)
-            Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(17), // Date (15 + 2 pad)
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(15),
+            Constraint::Min(0),
+            Constraint::Length(12),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1337,16 +1348,14 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject = 6 + 1 + 20 = 27 <= 30.
-        // Status, Name, Date, and Hash are removed in that order.
         let expected = vec![
-            Constraint::Length(6), // Graph
-            Constraint::Length(1), // Marker
-            Constraint::Length(0), // Status removed
-            Constraint::Min(0),    // Subject
-            Constraint::Length(0), // Name removed
-            Constraint::Length(0), // Hash removed
-            Constraint::Length(0), // Date removed
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(0),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1377,15 +1386,14 @@ mod tests {
             &columns,
         );
 
-        // Status, Name, Date, and Hash are removed to preserve the subject minimum.
         let expected = vec![
-            Constraint::Length(6), // Graph
-            Constraint::Length(1), // Marker
-            Constraint::Length(0), // Status removed
-            Constraint::Min(0),    // Subject
-            Constraint::Length(0), // Name removed
-            Constraint::Length(0), // Hash removed
-            Constraint::Length(0), // Date removed
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(0),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1416,15 +1424,14 @@ mod tests {
             &columns,
         );
 
-        // Name and Date are removed; status and hash still fit.
         let expected = vec![
-            Constraint::Length(6),  // Graph
-            Constraint::Length(1),  // Marker
-            Constraint::Length(15), // Status kept
-            Constraint::Min(0),     // Subject
-            Constraint::Length(0),  // Name removed
-            Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(0),  // Date removed
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(15),
+            Constraint::Min(0),
+            Constraint::Length(12),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1458,7 +1465,7 @@ mod tests {
             Constraint::Length(1),
             Constraint::Length(15),
             Constraint::Min(0),
-            Constraint::Length(9),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1488,11 +1495,11 @@ mod tests {
         );
 
         let expected = vec![
-            Constraint::Length(17), // Date (15 + 2 pad)
-            Constraint::Length(15), // Status
-            Constraint::Min(0),     // Subject
-            Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(6),  // Graph
+            Constraint::Length(0),
+            Constraint::Length(15),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(6),
         ];
         assert_eq!(actual, expected);
     }
