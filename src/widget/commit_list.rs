@@ -29,7 +29,7 @@ use crate::{
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default().respect_case());
 
 const ELLIPSIS: &str = "...";
-const STATUS_COLUMN_WIDTH: u16 = 15;
+const STATUS_COLUMN_WIDTH: u16 = 20;
 const FOCUSED_SELECTION_BG_FACTOR: f32 = 0.32;
 const UNFOCUSED_SELECTION_BG_FACTOR: f32 = 0.12;
 
@@ -1144,17 +1144,6 @@ fn display_branch_ref_spans(
 }
 
 fn author_color(commit: &Commit) -> Color {
-    const AUTHOR_COLORS: [Color; 8] = [
-        Color::Cyan,
-        Color::Green,
-        Color::Yellow,
-        Color::Blue,
-        Color::Magenta,
-        Color::LightCyan,
-        Color::LightGreen,
-        Color::LightYellow,
-    ];
-
     let identity = if commit.author_email.is_empty() {
         &commit.author_name
     } else {
@@ -1162,7 +1151,36 @@ fn author_color(commit: &Commit) -> Color {
     };
     let mut hasher = DefaultHasher::new();
     identity.hash(&mut hasher);
-    AUTHOR_COLORS[(hasher.finish() as usize) % AUTHOR_COLORS.len()]
+    hashed_author_color(hasher.finish())
+}
+
+fn hashed_author_color(seed: u64) -> Color {
+    let hue = (seed % 360) as f32;
+    let saturation = 0.68;
+    let value = 0.92;
+    hsv_to_rgb(hue, saturation, value)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> Color {
+    let chroma = value * saturation;
+    let hue_prime = hue / 60.0;
+    let x = chroma * (1.0 - ((hue_prime % 2.0) - 1.0).abs());
+
+    let (r1, g1, b1) = match hue_prime as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+
+    let m = value - chroma;
+    Color::Rgb(
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
 }
 
 fn highlighted_spans(
@@ -1422,7 +1440,7 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(15),
+            Constraint::Length(20),
             Constraint::Min(0),
             Constraint::Length(12),
             Constraint::Length(0),
@@ -1536,7 +1554,7 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(15),
+            Constraint::Length(20),
             Constraint::Min(0),
             Constraint::Length(12),
             Constraint::Length(0),
@@ -1572,7 +1590,7 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(15),
+            Constraint::Length(20),
             Constraint::Min(0),
             Constraint::Length(0),
         ];
@@ -1605,11 +1623,27 @@ mod tests {
 
         let expected = vec![
             Constraint::Length(0),
-            Constraint::Length(15),
+            Constraint::Length(20),
             Constraint::Min(0),
             Constraint::Length(0),
             Constraint::Length(6),
         ];
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn author_color_changes_between_authors() {
+        let alice = Commit {
+            author_name: "Alice".into(),
+            author_email: "alice@example.com".into(),
+            ..Commit::default()
+        };
+        let bob = Commit {
+            author_name: "Bob".into(),
+            author_email: "bob@example.com".into(),
+            ..Commit::default()
+        };
+
+        assert_ne!(author_color(&alice), author_color(&bob));
     }
 }
