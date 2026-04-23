@@ -108,10 +108,10 @@ impl<'a> RefsView<'a> {
             Layout::horizontal([Constraint::Length(refs_width), Constraint::Min(0)]).areas(area);
 
         let branch_visuals = self.as_list_state().branch_visuals();
-        let ref_list = RefList::new(&self.refs, branch_visuals, self.ctx.clone());
+        let ref_list = RefList::new(&self.refs, branch_visuals, self.ctx.clone(), true);
         f.render_stateful_widget(ref_list, refs_area, &mut self.ref_list_state);
 
-        let commit_list = CommitList::new(self.ctx.clone());
+        let commit_list = CommitList::new(self.ctx.clone(), false);
         f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
     }
 }
@@ -154,6 +154,7 @@ impl<'a> RefsView<'a> {
         let refs_context = RefsRefreshViewContext {
             selected: tree_selected,
             opened: tree_opened,
+            focus_sidebar: true,
         };
         let context = RefreshViewContext::Refs {
             list_context,

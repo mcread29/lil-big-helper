@@ -4,7 +4,7 @@ use std::{collections::HashSet, iter};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     widgets::{Block, Borders, Padding, StatefulWidget},
 };
 use semver::Version;
@@ -109,12 +109,22 @@ impl RefListState {
 pub struct RefList {
     items: Vec<TreeItem<'static, String>>,
     ctx: Rc<AppContext>,
+    focused: bool,
 }
 
 impl RefList {
-    pub fn new(refs: &[Ref], branch_visuals: Rc<BranchVisuals>, ctx: Rc<AppContext>) -> RefList {
+    pub fn new(
+        refs: &[Ref],
+        branch_visuals: Rc<BranchVisuals>,
+        ctx: Rc<AppContext>,
+        focused: bool,
+    ) -> RefList {
         let items = build_ref_tree_items(refs, &branch_visuals, &ctx.color_theme);
-        RefList { items, ctx }
+        RefList {
+            items,
+            ctx,
+            focused,
+        }
     }
 }
 
@@ -122,16 +132,18 @@ impl StatefulWidget for RefList {
     type State = RefListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let mut highlight_style = Style::default()
+            .bg(self.ctx.color_theme.ref_selected_bg)
+            .fg(self.ctx.color_theme.ref_selected_fg);
+        if !self.focused {
+            highlight_style = highlight_style.add_modifier(Modifier::DIM);
+        }
         let tree = Tree::new(&self.items)
             .unwrap()
             .node_closed_symbol("\u{25b8} ")
             .node_open_symbol("\u{25be} ")
             .node_no_children_symbol("  ")
-            .highlight_style(
-                Style::default()
-                    .bg(self.ctx.color_theme.ref_selected_bg)
-                    .fg(self.ctx.color_theme.ref_selected_fg),
-            )
+            .highlight_style(highlight_style)
             .block(
                 Block::default()
                     .borders(Borders::RIGHT)
@@ -444,7 +456,9 @@ fn tree_item_color(
 ) -> Color {
     match kind {
         TreeNodeKind::Branch => branch_visuals.color_for_name(identifier),
-        TreeNodeKind::RemoteBranch if identifier.contains('/') => branch_visuals.color_for_name(identifier),
+        TreeNodeKind::RemoteBranch if identifier.contains('/') => {
+            branch_visuals.color_for_name(identifier)
+        }
         TreeNodeKind::RemoteBranch => color_theme.fg,
         TreeNodeKind::Other => color_theme.fg,
     }

@@ -130,7 +130,7 @@ impl<'a> DetailView<'a> {
         let [list_area, detail_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(area);
 
-        let commit_list = CommitList::new(self.ctx.clone());
+        let commit_list = CommitList::new(self.ctx.clone(), true);
         f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
 
         let branch_visuals = self.as_list_state().branch_visuals();

@@ -675,13 +675,15 @@ impl<'a> CommitListState<'a> {
 
 pub struct CommitList<'a> {
     ctx: Rc<AppContext>,
+    focused: bool,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> CommitList<'a> {
-    pub fn new(ctx: Rc<AppContext>) -> Self {
+    pub fn new(ctx: Rc<AppContext>, focused: bool) -> Self {
         Self {
             ctx,
+            focused,
             _marker: std::marker::PhantomData,
         }
     }
@@ -929,6 +931,9 @@ impl CommitList<'_> {
             line = line
                 .bg(self.ctx.color_theme.list_selected_bg)
                 .fg(self.ctx.color_theme.list_selected_fg);
+            if !self.focused {
+                line = line.add_modifier(Modifier::DIM);
+            }
         }
         ListItem::new(line)
     }

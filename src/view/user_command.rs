@@ -140,7 +140,7 @@ impl<'a> UserCommandView<'a> {
             Layout::vertical([Constraint::Min(0), Constraint::Length(user_command_height)])
                 .areas(area);
 
-        let commit_list = CommitList::new(self.ctx.clone());
+        let commit_list = CommitList::new(self.ctx.clone(), true);
         f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
 
         let commit_user_command =

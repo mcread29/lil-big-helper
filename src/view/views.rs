@@ -60,10 +60,11 @@ impl<'a> View<'a> {
 
     pub fn of_list(
         commit_list_state: CommitListState<'a>,
+        refs: Vec<Ref>,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
-        View::List(Box::new(ListView::new(commit_list_state, ctx, tx)))
+        View::List(Box::new(ListView::new(commit_list_state, refs, ctx, tx)))
     }
 
     pub fn of_detail(
@@ -207,6 +208,7 @@ pub struct UserCommandRefreshViewContext {
 pub struct RefsRefreshViewContext {
     pub selected: Vec<String>,
     pub opened: Vec<Vec<String>>,
+    pub focus_sidebar: bool,
 }
 
 #[derive(Debug, Clone)]

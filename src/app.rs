@@ -153,7 +153,8 @@ impl<'a> App<'a> {
                 Head::None => {}
             }
         }
-        let view = View::of_list(commit_list_state, ctx.clone(), ec.sender());
+        let refs = repository.all_refs().into_iter().cloned().collect();
+        let view = View::of_list(commit_list_state, refs, ctx.clone(), ec.sender());
 
         let mut app = Self {
             repository,
@@ -990,7 +991,8 @@ impl App<'_> {
     fn close_detail(&mut self) {
         if let View::Detail(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -1014,7 +1016,8 @@ impl App<'_> {
     fn close_status(&mut self) {
         if let View::Status(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -1156,7 +1159,8 @@ impl App<'_> {
     fn close_user_command(&mut self) {
         if let View::UserCommand(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -1171,7 +1175,8 @@ impl App<'_> {
     fn close_refs(&mut self) {
         if let View::Refs(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -1238,8 +1243,7 @@ impl App<'_> {
                 self.open_user_command(user_command_context.n, None);
             }
             RefreshViewContext::Refs { refs_context, .. } => {
-                self.open_refs();
-                if let View::Refs(ref mut view) = self.view {
+                if let View::List(ref mut view) = self.view {
                     view.reset_refs_with(refs_context);
                 }
             }
