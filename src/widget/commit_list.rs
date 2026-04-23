@@ -997,6 +997,7 @@ fn status_spans<'a>(
             _ => None,
         })
         .collect::<FxHashSet<_>>();
+    let mut duplicate_remote_icons = FxHashMap::default();
     let mut ref_spans: Vec<(Vec<Span>, &String)> = Vec::new();
     for reference in refs
         .iter()
@@ -1022,6 +1023,7 @@ fn status_spans<'a>(
                 continue;
             };
             if local_branch_names.contains(&canonical_name) {
+                duplicate_remote_icons.insert(canonical_name, fg);
                 continue;
             }
         }
@@ -1068,9 +1070,16 @@ fn status_spans<'a>(
     let total_ref_spans = ref_spans.len();
     for (i, ss) in ref_spans.into_iter().enumerate() {
         let (ref_spans, ref_name) = ss;
+        let duplicate_remote_icon = duplicate_remote_icons
+            .get(ref_name.as_str())
+            .copied()
+            .map(|fg| remote_icon_only_spans(branch_visuals, fg));
         if let Head::Branch { name } = head {
             if ref_name == name {
                 spans.extend(branch_visuals.head_marker(Some(name), true, commit_info.graph_color));
+                if let Some(icon_spans) = duplicate_remote_icon.clone() {
+                    spans.extend(icon_spans);
+                }
                 if i + 1 < total_ref_spans {
                     spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
                 }
@@ -1078,6 +1087,9 @@ fn status_spans<'a>(
             }
         }
         spans.extend(ref_spans);
+        if let Some(icon_spans) = duplicate_remote_icon {
+            spans.extend(icon_spans);
+        }
         if i + 1 < total_ref_spans {
             spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
         }
@@ -1115,15 +1127,16 @@ fn display_branch_ref_spans(
     fg: Color,
     color_theme: &ColorTheme,
 ) -> Vec<Span<'static>> {
-    let (prefix, visible_name) = match reference {
-        Ref::RemoteBranch { .. } => ("☁ ", branch_visuals.display_text(reference, true)),
-        Ref::Branch { .. } => ("", branch_visuals.display_text(reference, true)),
-        _ => ("", full_name.to_string()),
+    let (show_remote_icon, visible_name) = match reference {
+        Ref::RemoteBranch { .. } => (true, branch_visuals.display_text(reference, true)),
+        Ref::Branch { .. } => (false, branch_visuals.display_text(reference, true)),
+        _ => (false, full_name.to_string()),
     };
 
     let mut spans = Vec::new();
-    if !prefix.is_empty() {
-        spans.push(Span::raw(prefix).fg(fg).bold());
+    if show_remote_icon {
+        spans.push(branch_visuals.remote_icon_marker(fg));
+        spans.push(branch_visuals.remote_spacing(fg));
     }
 
     let visible_spans = pos
@@ -1143,14 +1156,16 @@ fn display_branch_ref_spans(
     spans
 }
 
+fn remote_icon_only_spans(branch_visuals: &BranchVisuals, fg: Color) -> Vec<Span<'static>> {
+    vec![
+        Span::raw(" ").fg(fg).bold(),
+        branch_visuals.remote_icon_marker(fg),
+    ]
+}
+
 fn author_color(commit: &Commit) -> Color {
-    let identity = if commit.author_email.is_empty() {
-        &commit.author_name
-    } else {
-        &commit.author_email
-    };
     let mut hasher = DefaultHasher::new();
-    identity.hash(&mut hasher);
+    commit.commit_hash.as_str().hash(&mut hasher);
     hashed_author_color(hasher.finish())
 }
 
@@ -1343,9 +1358,10 @@ mod tests {
             &theme,
         );
 
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].content.as_ref(), "☁ ");
-        assert_eq!(spans[1].content.as_ref(), "audio-feedback");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "☁");
+        assert_eq!(spans[1].content.as_ref(), " ");
+        assert_eq!(spans[2].content.as_ref(), "audio-feedback");
     }
 
     #[test]
@@ -1388,7 +1404,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>();
-        assert_eq!(contents, vec!["◎", " ", "audio-feedback"]);
+        assert_eq!(contents, vec!["◎", " ", "audio-feedback", " ", "☁"]);
     }
 
     #[test]
@@ -1632,18 +1648,20 @@ mod tests {
     }
 
     #[test]
-    fn author_color_changes_between_authors() {
-        let alice = Commit {
+    fn author_color_changes_between_commits() {
+        let first = Commit {
+            commit_hash: CommitHash::from("abc1234"),
             author_name: "Alice".into(),
             author_email: "alice@example.com".into(),
             ..Commit::default()
         };
-        let bob = Commit {
-            author_name: "Bob".into(),
-            author_email: "bob@example.com".into(),
+        let second = Commit {
+            commit_hash: CommitHash::from("def5678"),
+            author_name: "Alice".into(),
+            author_email: "alice@example.com".into(),
             ..Commit::default()
         };
 
-        assert_ne!(author_color(&alice), author_color(&bob));
+        assert_ne!(author_color(&first), author_color(&second));
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     graph::Graph,
 };
 
-const REMOTE_ICON: &str = "☁ ";
+const REMOTE_ICON: &str = "☁";
 const HEAD_ICON: &str = "◎";
 
 #[derive(Debug)]
@@ -80,7 +80,7 @@ impl BranchVisuals {
             Ref::Branch { .. } => self.display_text(reference, shorten),
             Ref::RemoteBranch { .. } => {
                 let label = self.display_text(reference, shorten);
-                format!("{REMOTE_ICON}{label}")
+                format!("{REMOTE_ICON} {label}")
             }
             Ref::Tag { name, .. } | Ref::Stash { name, .. } => name.clone(),
         }
@@ -139,6 +139,14 @@ impl BranchVisuals {
             (head, reference),
             (Head::Branch { name }, Ref::Branch { name: ref_name, .. }) if name == ref_name
         )
+    }
+
+    pub fn remote_icon_marker<'a>(&self, color: Color) -> Span<'a> {
+        Span::raw(REMOTE_ICON).fg(color).bold()
+    }
+
+    pub fn remote_spacing<'a>(&self, color: Color) -> Span<'a> {
+        Span::raw(" ").fg(color).bold()
     }
 }
 
@@ -225,6 +233,17 @@ mod tests {
         assert_eq!(spans[0].content.as_ref(), "◎");
         assert_eq!(spans[1].content.as_ref(), " ");
         assert_eq!(spans[2].content.as_ref(), "audio-feedback");
+    }
+
+    #[test]
+    fn remote_icon_and_spacing_render_separately() {
+        let visuals = BranchVisuals {
+            ref_colors: FxHashMap::default(),
+            fallback_colors: vec![Color::Blue],
+        };
+
+        assert_eq!(visuals.remote_icon_marker(Color::Blue).content.as_ref(), "☁");
+        assert_eq!(visuals.remote_spacing(Color::Blue).content.as_ref(), " ");
     }
 
     #[test]
