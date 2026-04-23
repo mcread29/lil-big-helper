@@ -146,12 +146,11 @@ impl<'a> App<'a> {
             ctx.core_config.search.ignore_case,
             ctx.core_config.search.fuzzy,
         );
-        if let InitialSelection::Head = initial_selection {
-            match repository.head() {
-                Head::Branch { name } => commit_list_state.select_ref(name),
-                Head::Detached { target } => commit_list_state.select_commit_hash(target),
-                Head::None => {}
-            }
+        let _ = initial_selection;
+        match repository.head() {
+            Head::Branch { name } => commit_list_state.select_ref(name),
+            Head::Detached { target } => commit_list_state.select_commit_hash(target),
+            Head::None => {}
         }
         let refs = repository.all_refs().into_iter().cloned().collect();
         let view = View::of_list(commit_list_state, refs, ctx.clone(), ec.sender());

@@ -42,9 +42,13 @@ impl<'a> ListView<'a> {
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> ListView<'a> {
+        let mut ref_list_state = RefListState::new();
+        if let crate::git::Head::Branch { name } = commit_list_state.head() {
+            ref_list_state.select_branch_name(&refs, name);
+        }
         ListView {
             commit_list_state: Some(commit_list_state),
-            ref_list_state: RefListState::new(),
+            ref_list_state,
             refs,
             focus_pane: FocusPane::CommitList,
             ctx,

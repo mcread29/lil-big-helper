@@ -4,7 +4,7 @@ use std::{collections::HashSet, iter};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Style, Stylize},
     widgets::{Block, Borders, Padding, StatefulWidget},
 };
 use semver::Version;
@@ -21,6 +21,8 @@ const TREE_BRANCH_ROOT_TEXT: &str = "Branches";
 const TREE_REMOTE_ROOT_TEXT: &str = "Remotes";
 const TREE_TAG_ROOT_TEXT: &str = "Tags";
 const TREE_STASH_ROOT_TEXT: &str = "Stashes";
+const FOCUSED_SELECTION_BG_FACTOR: f32 = 0.32;
+const UNFOCUSED_SELECTION_BG_FACTOR: f32 = 0.12;
 
 #[derive(Debug, Default)]
 pub struct RefListState {
@@ -104,6 +106,31 @@ impl RefListState {
         }
         self.tree_state.select(selected);
     }
+
+    pub fn select_branch_name(&mut self, refs: &[Ref], branch_name: &str) {
+        let root = if refs.iter().any(|reference| {
+            matches!(reference, Ref::Branch { name, .. } if name == branch_name)
+        }) {
+            TREE_BRANCH_ROOT_IDENT
+        } else {
+            TREE_REMOTE_ROOT_IDENT
+        };
+
+        let mut selected = vec![root.to_string()];
+        let mut identifier = String::new();
+        for part in branch_name.split('/') {
+            if identifier.is_empty() {
+                identifier = part.to_string();
+            } else {
+                identifier = format!("{identifier}/{part}");
+            }
+            selected.push(identifier.clone());
+            self.tree_state.open(selected.clone());
+        }
+
+        let valid_paths = collect_valid_tree_paths(refs);
+        self.tree_state.select(sanitize_selected_path(selected, &valid_paths));
+    }
 }
 
 pub struct RefList {
@@ -132,12 +159,19 @@ impl StatefulWidget for RefList {
     type State = RefListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let mut highlight_style = Style::default()
-            .bg(self.ctx.color_theme.ref_selected_bg)
+        let highlight_style = Style::default()
+            .bg(if self.focused {
+                dim_selection_color(
+                    self.ctx.color_theme.ref_selected_bg,
+                    FOCUSED_SELECTION_BG_FACTOR,
+                )
+            } else {
+                dim_selection_color(
+                    self.ctx.color_theme.ref_selected_bg,
+                    UNFOCUSED_SELECTION_BG_FACTOR,
+                )
+            })
             .fg(self.ctx.color_theme.ref_selected_fg);
-        if !self.focused {
-            highlight_style = highlight_style.add_modifier(Modifier::DIM);
-        }
         let tree = Tree::new(&self.items)
             .unwrap()
             .node_closed_symbol("\u{25b8} ")
@@ -152,6 +186,30 @@ impl StatefulWidget for RefList {
             );
         tree.render(area, buf, &mut state.tree_state);
     }
+}
+
+fn dim_selection_color(color: Color, factor: f32) -> Color {
+    let (r, g, b) = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::DarkGray => (128, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::White => (255, 255, 255),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        other => return other,
+    };
+    Color::Rgb((r as f32 * factor) as u8, (g as f32 * factor) as u8, (b as f32 * factor) as u8)
 }
 
 fn collect_valid_tree_paths(refs: &[Ref]) -> HashSet<Vec<String>> {
@@ -556,6 +614,33 @@ mod tests {
         assert_eq!(
             tree_item_color("v1.0.0", &visuals, &theme, TreeNodeKind::Other),
             Color::White
+        );
+    }
+
+    #[test]
+    fn select_branch_name_highlights_head_branch_path() {
+        let refs = vec![
+            Ref::Branch {
+                name: "mason/audio-feedback".into(),
+                target: CommitHash::from("0123456789abcdef0123456789abcdef01234567"),
+            },
+            Ref::RemoteBranch {
+                name: "origin/mason/audio-feedback".into(),
+                target: CommitHash::from("0123456789abcdef0123456789abcdef01234567"),
+            },
+        ];
+        let mut state = RefListState::new();
+
+        state.select_branch_name(&refs, "mason/audio-feedback");
+
+        let (selected, _) = state.current_tree_status();
+        assert_eq!(
+            selected,
+            vec![
+                TREE_BRANCH_ROOT_IDENT.to_string(),
+                "mason".to_string(),
+                "mason/audio-feedback".to_string(),
+            ]
         );
     }
 }

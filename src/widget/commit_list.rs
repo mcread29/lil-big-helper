@@ -30,6 +30,8 @@ static FUZZY_MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default(
 
 const ELLIPSIS: &str = "...";
 const STATUS_COLUMN_WIDTH: u16 = 15;
+const FOCUSED_SELECTION_BG_FACTOR: f32 = 0.32;
+const UNFOCUSED_SELECTION_BG_FACTOR: f32 = 0.12;
 
 #[derive(Debug)]
 pub struct CommitInfo<'a> {
@@ -928,15 +930,45 @@ impl CommitList<'_> {
         spans.push(Span::raw(" "));
         let mut line = Line::from(spans).alignment(alignment);
         if i == state.selected {
-            line = line
-                .bg(self.ctx.color_theme.list_selected_bg)
-                .fg(self.ctx.color_theme.list_selected_fg);
-            if !self.focused {
-                line = line.add_modifier(Modifier::DIM);
-            }
+            let bg = if self.focused {
+                dim_selection_color(
+                    self.ctx.color_theme.list_selected_bg,
+                    FOCUSED_SELECTION_BG_FACTOR,
+                )
+            } else {
+                dim_selection_color(
+                    self.ctx.color_theme.list_selected_bg,
+                    UNFOCUSED_SELECTION_BG_FACTOR,
+                )
+            };
+            line = line.bg(bg).fg(self.ctx.color_theme.list_selected_fg);
         }
         ListItem::new(line)
     }
+}
+
+fn dim_selection_color(color: Color, factor: f32) -> Color {
+    let (r, g, b) = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::DarkGray => (128, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::White => (255, 255, 255),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        other => return other,
+    };
+    Color::Rgb((r as f32 * factor) as u8, (g as f32 * factor) as u8, (b as f32 * factor) as u8)
 }
 
 fn status_spans<'a>(
@@ -954,41 +986,64 @@ fn status_spans<'a>(
         }
     }
 
-    let ref_spans: Vec<(Vec<Span>, &String)> = refs
+    let local_branch_names = refs
         .iter()
-        .filter_map(|r| match r {
-            Ref::Branch { name, .. } => Some((r, name, branch_visuals.color_for_ref(r))),
-            Ref::RemoteBranch { name, .. } => Some((r, name, branch_visuals.color_for_ref(r))),
-            Ref::Tag { name, .. } => Some((r, name, color_theme.list_ref_tag_fg)),
-            Ref::Stash { .. } => None,
+        .filter_map(|reference| match reference {
+            Ref::Branch { .. } => branch_visuals.canonical_branch_name(reference),
+            _ => None,
         })
-        .map(|(reference, name, fg)| {
-            let spans = match reference {
-                Ref::Branch { .. } | Ref::RemoteBranch { .. } => display_branch_ref_spans(
-                    reference,
-                    name,
-                    refs_matches.get(name),
-                    fg,
-                    color_theme,
-                ),
-                _ => refs_matches
-                    .get(name)
-                    .and_then(|pos| display_match_position(name, name, pos))
-                    .map(|pos| {
-                        highlighted_spans(
-                            Span::raw(name.clone()),
-                            pos,
-                            fg,
-                            Modifier::BOLD,
-                            color_theme,
-                            false,
-                        )
-                    })
-                    .unwrap_or_else(|| vec![Span::raw(name.clone()).fg(fg).bold()]),
+        .collect::<FxHashSet<_>>();
+    let mut ref_spans: Vec<(Vec<Span>, &String)> = Vec::new();
+    for reference in refs.iter().filter(|reference| !matches!(reference, Ref::Stash { .. })) {
+        let name = match reference {
+            Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } | Ref::Tag { name, .. } => {
+                name
+            }
+            Ref::Stash { .. } => continue,
+        };
+
+        let fg = match reference {
+            Ref::Branch { .. } | Ref::RemoteBranch { .. } => branch_visuals.color_for_ref(reference),
+            Ref::Tag { .. } => color_theme.list_ref_tag_fg,
+            Ref::Stash { .. } => continue,
+        };
+
+        if matches!(reference, Ref::RemoteBranch { .. }) {
+            let Some(canonical_name) = branch_visuals.canonical_branch_name(reference) else {
+                continue;
             };
-            (spans, name)
-        })
-        .collect();
+            if local_branch_names.contains(&canonical_name) {
+                continue;
+            }
+        }
+
+        let spans = match reference {
+            Ref::Branch { .. } | Ref::RemoteBranch { .. } => display_branch_ref_spans(
+                branch_visuals,
+                reference,
+                name,
+                refs_matches.get(name),
+                fg,
+                color_theme,
+            ),
+            Ref::Tag { .. } => refs_matches
+                .get(name)
+                .and_then(|pos| display_match_position(name, name, pos))
+                .map(|pos| {
+                    highlighted_spans(
+                        Span::raw(name.clone()),
+                        pos,
+                        fg,
+                        Modifier::BOLD,
+                        color_theme,
+                        false,
+                    )
+                })
+                .unwrap_or_else(|| vec![Span::raw(name.clone()).fg(fg).bold()]),
+            Ref::Stash { .. } => continue,
+        };
+        ref_spans.push((spans, name));
+    }
 
     let mut spans = Vec::new();
 
@@ -1044,6 +1099,7 @@ fn display_match_position(
 }
 
 fn display_branch_ref_spans(
+    branch_visuals: &BranchVisuals,
     reference: &Ref,
     full_name: &str,
     pos: Option<&SearchMatchPosition>,
@@ -1051,9 +1107,9 @@ fn display_branch_ref_spans(
     color_theme: &ColorTheme,
 ) -> Vec<Span<'static>> {
     let (prefix, visible_name) = match reference {
-        Ref::RemoteBranch { .. } => ("☁ ", last_segment_after_remote(full_name)),
-        Ref::Branch { .. } => ("", final_segment(full_name)),
-        _ => ("", full_name),
+        Ref::RemoteBranch { .. } => ("☁ ", branch_visuals.display_text(reference, true)),
+        Ref::Branch { .. } => ("", branch_visuals.display_text(reference, true)),
+        _ => ("", full_name.to_string()),
     };
 
     let mut spans = Vec::new();
@@ -1062,7 +1118,7 @@ fn display_branch_ref_spans(
     }
 
     let visible_spans = pos
-        .and_then(|pos| display_match_position(full_name, visible_name, pos))
+        .and_then(|pos| display_match_position(full_name, &visible_name, pos))
         .map(|pos| {
             highlighted_spans(
                 Span::raw(visible_name.to_string()),
@@ -1076,15 +1132,6 @@ fn display_branch_ref_spans(
         .unwrap_or_else(|| vec![Span::raw(visible_name.to_string()).fg(fg).bold()]);
     spans.extend(visible_spans);
     spans
-}
-
-fn final_segment(name: &str) -> &str {
-    name.rsplit('/').next().unwrap_or(name)
-}
-
-fn last_segment_after_remote(name: &str) -> &str {
-    let branch_name = name.split_once('/').map(|(_, rest)| rest).unwrap_or(name);
-    final_segment(branch_name)
 }
 
 fn author_color(commit: &Commit) -> Color {
@@ -1255,8 +1302,13 @@ mod tests {
             target: CommitHash::from("abc1234"),
         };
         let theme = ColorTheme::default();
+        let branch_visuals = BranchVisuals {
+            ref_colors: FxHashMap::default(),
+            fallback_colors: vec![Color::Blue],
+        };
 
         let spans = display_branch_ref_spans(
+            &branch_visuals,
             &reference,
             "origin/mason/audio-feedback",
             None,
@@ -1267,6 +1319,49 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content.as_ref(), "☁ ");
         assert_eq!(spans[1].content.as_ref(), "audio-feedback");
+    }
+
+    #[test]
+    fn status_spans_dedupes_matching_local_and_remote_refs() {
+        let commit = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            ..Commit::default()
+        };
+        let branch = Ref::Branch {
+            name: "mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let remote = Ref::RemoteBranch {
+            name: "origin/mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let commit_info = CommitInfo::new(&commit, vec![&branch, &remote], Color::Green);
+        let branch_visuals = BranchVisuals {
+            ref_colors: FxHashMap::from_iter([
+                ("mason/audio-feedback".to_string(), Color::Green),
+                ("origin/mason/audio-feedback".to_string(), Color::Green),
+            ]),
+            fallback_colors: vec![Color::Green],
+        };
+        let head = Head::Branch {
+            name: "mason/audio-feedback".into(),
+        };
+        let refs_matches = FxHashMap::default();
+        let color_theme = ColorTheme::default();
+
+        let spans = status_spans(
+            &commit_info,
+            &head,
+            &branch_visuals,
+            &refs_matches,
+            &color_theme,
+        );
+
+        let contents = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, vec!["◎", " ", "audio-feedback"]);
     }
 
     #[test]

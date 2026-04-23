@@ -107,6 +107,14 @@ impl BranchVisuals {
         }
     }
 
+    pub fn canonical_branch_name(&self, reference: &Ref) -> Option<String> {
+        match reference {
+            Ref::Branch { name, .. } => Some(name.clone()),
+            Ref::RemoteBranch { name, .. } => Some(strip_remote_prefix(name).to_string()),
+            Ref::Tag { .. } | Ref::Stash { .. } => None,
+        }
+    }
+
     pub fn head_marker<'a>(
         &self,
         branch_name: Option<&str>,
@@ -115,7 +123,7 @@ impl BranchVisuals {
     ) -> Vec<Span<'a>> {
         let mut spans = vec![Span::raw(HEAD_ICON).fg(color).add_modifier(Modifier::BOLD)];
         if let Some(branch_name) = branch_name {
-            spans.push(Span::raw(" -> ").fg(color).add_modifier(Modifier::BOLD));
+            spans.push(Span::raw(" ").fg(color).add_modifier(Modifier::BOLD));
             let label = if shorten {
                 final_branch_segment(branch_name).to_string()
             } else {
@@ -215,6 +223,7 @@ mod tests {
         let spans = visuals.head_marker(Some("mason/audio-feedback"), true, Color::Green);
 
         assert_eq!(spans[0].content.as_ref(), "◎");
+        assert_eq!(spans[1].content.as_ref(), " ");
         assert_eq!(spans[2].content.as_ref(), "audio-feedback");
     }
 
