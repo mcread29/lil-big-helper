@@ -108,9 +108,10 @@ impl RefListState {
     }
 
     pub fn select_branch_name(&mut self, refs: &[Ref], branch_name: &str) {
-        let root = if refs.iter().any(|reference| {
-            matches!(reference, Ref::Branch { name, .. } if name == branch_name)
-        }) {
+        let root = if refs
+            .iter()
+            .any(|reference| matches!(reference, Ref::Branch { name, .. } if name == branch_name))
+        {
             TREE_BRANCH_ROOT_IDENT
         } else {
             TREE_REMOTE_ROOT_IDENT
@@ -129,7 +130,8 @@ impl RefListState {
         }
 
         let valid_paths = collect_valid_tree_paths(refs);
-        self.tree_state.select(sanitize_selected_path(selected, &valid_paths));
+        self.tree_state
+            .select(sanitize_selected_path(selected, &valid_paths));
     }
 }
 
@@ -209,7 +211,11 @@ fn dim_selection_color(color: Color, factor: f32) -> Color {
         Color::LightCyan => (41, 184, 219),
         other => return other,
     };
-    Color::Rgb((r as f32 * factor) as u8, (g as f32 * factor) as u8, (b as f32 * factor) as u8)
+    Color::Rgb(
+        (r as f32 * factor) as u8,
+        (g as f32 * factor) as u8,
+        (b as f32 * factor) as u8,
+    )
 }
 
 fn collect_valid_tree_paths(refs: &[Ref]) -> HashSet<Vec<String>> {
