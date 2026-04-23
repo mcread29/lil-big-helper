@@ -23,6 +23,7 @@ use crate::{
     config::UserListColumnType,
     git::{Commit, CommitHash, Head, Ref},
     graph::GraphImageManager,
+    widget::branch_visual::BranchVisuals,
 };
 
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default().respect_case());
@@ -184,6 +185,7 @@ pub struct CommitListState<'a> {
     graph_image_manager: GraphImageManager<'a>,
     graph_cell_width: u16,
     head: &'a Head,
+    branch_visuals: Rc<BranchVisuals>,
 
     ref_name_to_commit_index_map: FxHashMap<&'a str, usize>,
 
@@ -206,6 +208,7 @@ impl<'a> CommitListState<'a> {
         graph_image_manager: GraphImageManager<'a>,
         graph_cell_width: u16,
         head: &'a Head,
+        branch_visuals: Rc<BranchVisuals>,
         ref_name_to_commit_index_map: FxHashMap<&'a str, usize>,
         default_ignore_case: bool,
         default_fuzzy: bool,
@@ -218,6 +221,7 @@ impl<'a> CommitListState<'a> {
             graph_image_manager,
             graph_cell_width,
             head,
+            branch_visuals,
             ref_name_to_commit_index_map,
             search_state: SearchState::Inactive,
             search_input: Input::default(),
@@ -233,6 +237,14 @@ impl<'a> CommitListState<'a> {
 
     pub fn graph_area_cell_width(&self) -> u16 {
         self.graph_cell_width + 1 // right pad
+    }
+
+    pub fn branch_visuals(&self) -> Rc<BranchVisuals> {
+        self.branch_visuals.clone()
+    }
+
+    pub fn head(&self) -> &Head {
+        self.head
     }
 
     pub fn select_next(&mut self) {
@@ -383,6 +395,10 @@ impl<'a> CommitListState<'a> {
         &self.commits[self.current_selected_index()]
             .commit
             .commit_hash
+    }
+
+    pub fn selected_commit_graph_color(&self) -> Color {
+        self.commits[self.current_selected_index()].graph_color
     }
 
     fn current_selected_index(&self) -> usize {
@@ -817,6 +833,7 @@ impl CommitList<'_> {
                 let spans = status_spans(
                     commit_info,
                     state.head,
+                    &state.branch_visuals,
                     &state.search_matches[state.offset + i].refs,
                     &self.ctx.color_theme,
                 );
@@ -955,6 +972,7 @@ impl CommitList<'_> {
 fn status_spans<'a>(
     commit_info: &'a CommitInfo,
     head: &'a Head,
+    branch_visuals: &'a BranchVisuals,
     refs_matches: &'a FxHashMap<String, SearchMatchPosition>,
     color_theme: &'a ColorTheme,
 ) -> Vec<Span<'a>> {
@@ -969,34 +987,36 @@ fn status_spans<'a>(
     let ref_spans: Vec<(Vec<Span>, &String)> = refs
         .iter()
         .filter_map(|r| match r {
-            Ref::Branch { name, .. } => {
-                let fg = color_theme.list_ref_branch_fg;
-                Some((name, fg))
-            }
-            Ref::RemoteBranch { name, .. } => {
-                let fg = color_theme.list_ref_remote_branch_fg;
-                Some((name, fg))
-            }
-            Ref::Tag { name, .. } => {
-                let fg = color_theme.list_ref_tag_fg;
-                Some((name, fg))
-            }
+            Ref::Branch { name, .. } => Some((r, name, branch_visuals.color_for_ref(r))),
+            Ref::RemoteBranch { name, .. } => Some((r, name, branch_visuals.color_for_ref(r))),
+            Ref::Tag { name, .. } => Some((r, name, color_theme.list_ref_tag_fg)),
             Ref::Stash { .. } => None,
         })
-        .map(|(name, fg)| {
-            let spans = refs_matches
-                .get(name)
-                .map(|pos| {
-                    highlighted_spans(
-                        name.into(),
-                        pos.clone(),
-                        fg,
-                        Modifier::BOLD,
-                        color_theme,
-                        false,
-                    )
-                })
-                .unwrap_or_else(|| vec![Span::raw(name).fg(fg).bold()]);
+        .map(|(reference, name, fg)| {
+            let spans = match reference {
+                Ref::Branch { .. } | Ref::RemoteBranch { .. } => display_branch_ref_spans(
+                    reference,
+                    name,
+                    refs_matches.get(name),
+                    fg,
+                    color_theme,
+                    branch_visuals,
+                ),
+                _ => refs_matches
+                    .get(name)
+                    .and_then(|pos| display_match_position(name, name, pos))
+                    .map(|pos| {
+                        highlighted_spans(
+                            Span::raw(name.clone()),
+                            pos,
+                            fg,
+                            Modifier::BOLD,
+                            color_theme,
+                            false,
+                        )
+                    })
+                    .unwrap_or_else(|| vec![Span::raw(name.clone()).fg(fg).bold()]),
+            };
             (spans, name)
         })
         .collect();
@@ -1005,27 +1025,99 @@ fn status_spans<'a>(
 
     if let Head::Detached { target } = head {
         if commit_info.commit.commit_hash == *target {
-            spans.push(Span::raw("HEAD").fg(commit_info.graph_color).bold());
+            spans.extend(branch_visuals.head_marker(None, false, commit_info.graph_color));
             if !ref_spans.is_empty() {
                 spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
             }
         }
     }
 
+    let total_ref_spans = ref_spans.len();
     for (i, ss) in ref_spans.into_iter().enumerate() {
         let (ref_spans, ref_name) = ss;
         if let Head::Branch { name } = head {
             if ref_name == name {
-                spans.push(Span::raw("HEAD -> ").fg(commit_info.graph_color).bold());
+                spans.extend(branch_visuals.head_marker(Some(name), true, commit_info.graph_color));
+                if i + 1 < total_ref_spans {
+                    spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
+                }
+                continue;
             }
         }
         spans.extend(ref_spans);
-        if i < refs.len() - 1 {
+        if i + 1 < total_ref_spans {
             spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
         }
     }
 
     spans
+}
+
+fn display_match_position(
+    full_name: &str,
+    display_label: &str,
+    pos: &SearchMatchPosition,
+) -> Option<SearchMatchPosition> {
+    let offset = full_name.len().saturating_sub(display_label.len());
+    let matched_indices = pos
+        .matched_indices
+        .iter()
+        .copied()
+        .filter(|index| *index >= offset)
+        .map(|index| index - offset)
+        .collect::<Vec<_>>();
+
+    if matched_indices.is_empty() {
+        None
+    } else {
+        Some(SearchMatchPosition::new(matched_indices))
+    }
+}
+
+fn display_branch_ref_spans(
+    reference: &Ref,
+    full_name: &str,
+    pos: Option<&SearchMatchPosition>,
+    fg: Color,
+    color_theme: &ColorTheme,
+    branch_visuals: &BranchVisuals,
+) -> Vec<Span<'static>> {
+    let display_label = branch_visuals.display_label(reference, true);
+    let (prefix, visible_name) = match reference {
+        Ref::RemoteBranch { .. } => ("☁ ", last_segment_after_remote(full_name)),
+        Ref::Branch { .. } => ("", final_segment(full_name)),
+        _ => ("", full_name),
+    };
+
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::raw(prefix).fg(fg).bold());
+    }
+
+    let visible_spans = pos
+        .and_then(|pos| display_match_position(full_name, visible_name, pos))
+        .map(|pos| {
+            highlighted_spans(
+                Span::raw(visible_name.to_string()),
+                pos,
+                fg,
+                Modifier::BOLD,
+                color_theme,
+                false,
+            )
+        })
+        .unwrap_or_else(|| vec![Span::raw(display_label).fg(fg).bold()]);
+    spans.extend(visible_spans);
+    spans
+}
+
+fn final_segment(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn last_segment_after_remote(name: &str) -> &str {
+    let branch_name = name.split_once('/').map(|(_, rest)| rest).unwrap_or(name);
+    final_segment(branch_name)
 }
 
 fn author_color(commit: &Commit) -> Color {
@@ -1173,6 +1265,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_match_position_handles_shortened_remote_labels() {
+        let pos = SearchMatchPosition::new(vec![19, 20, 21]);
+        let display = display_match_position("origin/mason/audio-feedback", "feedback", &pos)
+            .expect("suffix match should be preserved");
+
+        assert_eq!(display.matched_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn test_calc_cell_widths_all_columns() {
         let area_width = 80;
         let subject_min_width = 20;
@@ -1239,13 +1340,13 @@ mod tests {
         // Graph + Marker + Subject = 6 + 1 + 20 = 27 <= 30.
         // Status, Name, Date, and Hash are removed in that order.
         let expected = vec![
-            Constraint::Length(6),  // Graph
-            Constraint::Length(1),  // Marker
-            Constraint::Length(0),  // Status removed
-            Constraint::Min(0),     // Subject
-            Constraint::Length(0),  // Name removed
-            Constraint::Length(0),  // Hash removed
-            Constraint::Length(0),  // Date removed
+            Constraint::Length(6), // Graph
+            Constraint::Length(1), // Marker
+            Constraint::Length(0), // Status removed
+            Constraint::Min(0),    // Subject
+            Constraint::Length(0), // Name removed
+            Constraint::Length(0), // Hash removed
+            Constraint::Length(0), // Date removed
         ];
         assert_eq!(actual, expected);
     }
@@ -1278,13 +1379,13 @@ mod tests {
 
         // Status, Name, Date, and Hash are removed to preserve the subject minimum.
         let expected = vec![
-            Constraint::Length(6),  // Graph
-            Constraint::Length(1),  // Marker
-            Constraint::Length(0),  // Status removed
-            Constraint::Min(0),     // Subject
-            Constraint::Length(0),  // Name removed
-            Constraint::Length(0),  // Hash removed
-            Constraint::Length(0),  // Date removed
+            Constraint::Length(6), // Graph
+            Constraint::Length(1), // Marker
+            Constraint::Length(0), // Status removed
+            Constraint::Min(0),    // Subject
+            Constraint::Length(0), // Name removed
+            Constraint::Length(0), // Hash removed
+            Constraint::Length(0), // Date removed
         ];
         assert_eq!(actual, expected);
     }

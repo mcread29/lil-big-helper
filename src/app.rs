@@ -25,7 +25,10 @@ use crate::{
     protocol::ImageProtocol,
     repo_state::{load_repo_state, save_repo_state},
     view::{RefreshViewContext, View},
-    widget::commit_list::{CommitInfo, CommitListState},
+    widget::{
+        branch_visual::BranchVisuals,
+        commit_list::{CommitInfo, CommitListState},
+    },
 };
 
 #[derive(Debug, Default)]
@@ -112,6 +115,7 @@ impl<'a> App<'a> {
         ec: &'a EventController,
         refresh_view_context: Option<RefreshViewContext>,
     ) -> Self {
+        let branch_visuals = BranchVisuals::new(repository, graph, graph_color_set).rc();
         let mut ref_name_to_commit_index_map = FxHashMap::default();
         let commits = graph
             .commits
@@ -137,6 +141,7 @@ impl<'a> App<'a> {
             graph_image_manager,
             graph_cell_width,
             head,
+            branch_visuals,
             ref_name_to_commit_index_map,
             ctx.core_config.search.ignore_case,
             ctx.core_config.search.fuzzy,

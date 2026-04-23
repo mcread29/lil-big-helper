@@ -107,7 +107,8 @@ impl<'a> RefsView<'a> {
         let [refs_area, list_area] =
             Layout::horizontal([Constraint::Length(refs_width), Constraint::Min(0)]).areas(area);
 
-        let ref_list = RefList::new(&self.refs, self.ctx.clone());
+        let branch_visuals = self.as_list_state().branch_visuals();
+        let ref_list = RefList::new(&self.refs, branch_visuals, self.ctx.clone());
         f.render_stateful_widget(ref_list, refs_area, &mut self.ref_list_state);
 
         let commit_list = CommitList::new(self.ctx.clone());

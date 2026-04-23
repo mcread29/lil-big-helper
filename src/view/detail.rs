@@ -133,8 +133,18 @@ impl<'a> DetailView<'a> {
         let commit_list = CommitList::new(self.ctx.clone());
         f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
 
-        let commit_detail =
-            CommitDetail::new(&self.commit, &self.changes, &self.refs, self.ctx.clone());
+        let branch_visuals = self.as_list_state().branch_visuals();
+        let head = self.as_list_state().head().clone();
+        let graph_color = self.as_list_state().selected_commit_graph_color();
+        let commit_detail = CommitDetail::new(
+            &self.commit,
+            &self.changes,
+            &self.refs,
+            &head,
+            graph_color,
+            branch_visuals,
+            self.ctx.clone(),
+        );
         f.render_stateful_widget(commit_detail, detail_area, &mut self.commit_detail_state);
     }
 }

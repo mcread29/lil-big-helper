@@ -4,14 +4,15 @@ use chrono::{DateTime, FixedOffset};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph, StatefulWidget, Widget},
 };
 
 use crate::{
     app::AppContext,
-    git::{Commit, FileChange, Ref},
+    git::{Commit, FileChange, Head, Ref},
+    widget::branch_visual::BranchVisuals,
 };
 
 #[derive(Debug, Default)]
@@ -58,6 +59,9 @@ pub struct CommitDetail<'a> {
     commit: &'a Commit,
     changes: &'a Vec<FileChange>,
     refs: &'a Vec<Ref>,
+    head: &'a Head,
+    graph_color: Color,
+    branch_visuals: Rc<BranchVisuals>,
     ctx: Rc<AppContext>,
 }
 
@@ -66,12 +70,18 @@ impl<'a> CommitDetail<'a> {
         commit: &'a Commit,
         changes: &'a Vec<FileChange>,
         refs: &'a Vec<Ref>,
+        head: &'a Head,
+        graph_color: Color,
+        branch_visuals: Rc<BranchVisuals>,
         ctx: Rc<AppContext>,
     ) -> Self {
         Self {
             commit,
             changes,
             refs,
+            head,
+            graph_color,
+            branch_visuals,
             ctx,
         }
     }
@@ -226,29 +236,61 @@ impl CommitDetail<'_> {
     }
 
     fn refs_line(&self) -> Line<'_> {
-        let ref_spans = self.refs.iter().filter_map(|r| match r {
-            Ref::Branch { name, .. } => Some(
-                Span::raw(name)
-                    .fg(self.ctx.color_theme.detail_ref_branch_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Ref::RemoteBranch { name, .. } => Some(
-                Span::raw(name)
-                    .fg(self.ctx.color_theme.detail_ref_remote_branch_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Ref::Tag { name, .. } => Some(
-                Span::raw(name)
-                    .fg(self.ctx.color_theme.detail_ref_tag_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Ref::Stash { .. } => None,
-        });
-
         let mut spans = Vec::new();
-        for (i, ref_span) in ref_spans.enumerate() {
-            spans.push(ref_span);
-            if i < self.refs.len() - 1 {
+        let branch_refs = self
+            .refs
+            .iter()
+            .filter(|r| !matches!(r, Ref::Stash { .. }))
+            .collect::<Vec<_>>();
+        let total_rendered_refs = branch_refs.len();
+        let mut rendered_count = 0usize;
+
+        if let Head::Detached { target } = self.head {
+            if self.commit.commit_hash == *target {
+                spans.extend(
+                    self.branch_visuals
+                        .head_marker(None, false, self.graph_color),
+                );
+                rendered_count += 1;
+                if !branch_refs.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+            }
+        }
+
+        for reference in branch_refs {
+            let ref_spans = match reference {
+                Ref::Branch { .. } => {
+                    if self.branch_visuals.head_attached_to(self.head, reference) {
+                        self.branch_visuals.head_marker(
+                            Some(reference.name()),
+                            false,
+                            self.graph_color,
+                        )
+                    } else {
+                        vec![
+                            Span::raw(self.branch_visuals.display_label(reference, false))
+                                .fg(self.branch_visuals.color_for_ref(reference))
+                                .add_modifier(Modifier::BOLD),
+                        ]
+                    }
+                }
+                Ref::RemoteBranch { .. } => {
+                    vec![
+                        Span::raw(self.branch_visuals.display_label(reference, false))
+                            .fg(self.branch_visuals.color_for_ref(reference))
+                            .add_modifier(Modifier::BOLD),
+                    ]
+                }
+                Ref::Tag { name, .. } => vec![Span::raw(name)
+                    .fg(self.ctx.color_theme.detail_ref_tag_fg)
+                    .add_modifier(Modifier::BOLD)],
+                Ref::Stash { .. } => continue,
+            };
+
+            spans.extend(ref_spans);
+            rendered_count += 1;
+            if rendered_count < total_rendered_refs {
                 spans.push(Span::raw(" "));
             }
         }
