@@ -968,7 +968,11 @@ fn dim_selection_color(color: Color, factor: f32) -> Color {
         Color::LightCyan => (41, 184, 219),
         other => return other,
     };
-    Color::Rgb((r as f32 * factor) as u8, (g as f32 * factor) as u8, (b as f32 * factor) as u8)
+    Color::Rgb(
+        (r as f32 * factor) as u8,
+        (g as f32 * factor) as u8,
+        (b as f32 * factor) as u8,
+    )
 }
 
 fn status_spans<'a>(
@@ -994,7 +998,10 @@ fn status_spans<'a>(
         })
         .collect::<FxHashSet<_>>();
     let mut ref_spans: Vec<(Vec<Span>, &String)> = Vec::new();
-    for reference in refs.iter().filter(|reference| !matches!(reference, Ref::Stash { .. })) {
+    for reference in refs
+        .iter()
+        .filter(|reference| !matches!(reference, Ref::Stash { .. }))
+    {
         let name = match reference {
             Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } | Ref::Tag { name, .. } => {
                 name
@@ -1003,7 +1010,9 @@ fn status_spans<'a>(
         };
 
         let fg = match reference {
-            Ref::Branch { .. } | Ref::RemoteBranch { .. } => branch_visuals.color_for_ref(reference),
+            Ref::Branch { .. } | Ref::RemoteBranch { .. } => {
+                branch_visuals.color_for_ref(reference)
+            }
             Ref::Tag { .. } => color_theme.list_ref_tag_fg,
             Ref::Stash { .. } => continue,
         };
