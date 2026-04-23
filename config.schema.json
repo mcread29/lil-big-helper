@@ -225,6 +225,7 @@
               "default": [
                 "graph",
                 "marker",
+                "status",
                 "subject",
                 "name",
                 "hash",
@@ -675,6 +676,7 @@
       "enum": [
         "graph",
         "marker",
+        "status",
         "subject",
         "name",
         "hash",

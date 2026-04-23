@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, FixedOffset};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Result;
 
@@ -103,6 +103,14 @@ pub enum Head {
 pub enum SortCommit {
     Chronological,
     Topological,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchScope {
+    pub current_branch: Option<String>,
+    pub base_branch: String,
+    pub branch_prefix: String,
+    pub branch_origins: FxHashMap<String, String>,
 }
 
 type CommitMap = FxHashMap<CommitHash, Commit>;
@@ -214,6 +222,114 @@ impl Repository {
 
     pub fn head(&self) -> &Head {
         &self.head
+    }
+
+    pub fn filtered_for_branch_scope(&self, scope: &BranchScope) -> Self {
+        let prefix = format!("{}/", scope.branch_prefix.trim_matches('/'));
+        let mut visible_local_branches: FxHashSet<String> = FxHashSet::default();
+        visible_local_branches.insert(scope.base_branch.clone());
+        if let Some(current_branch) = &scope.current_branch {
+            visible_local_branches.insert(current_branch.clone());
+        }
+
+        for reference in self.all_refs() {
+            if let Ref::Branch { name, .. } = reference {
+                let matches_scope = scope
+                    .branch_origins
+                    .get(name)
+                    .map(|origin| origin == &scope.base_branch)
+                    .unwrap_or(false)
+                    && name.starts_with(&prefix);
+                if matches_scope {
+                    visible_local_branches.insert(name.clone());
+                }
+            }
+        }
+
+        let mut visible_ref_names: FxHashSet<String> = FxHashSet::default();
+        for branch in &visible_local_branches {
+            visible_ref_names.insert(branch.clone());
+            visible_ref_names.insert(format!("origin/{branch}"));
+        }
+        visible_ref_names.insert(format!("origin/{}", scope.base_branch));
+
+        let mut visible_commit_hashes: FxHashSet<CommitHash> = FxHashSet::default();
+        let mut stack = Vec::new();
+
+        for reference in self.all_refs() {
+            match reference {
+                Ref::Branch { name, target } | Ref::RemoteBranch { name, target }
+                    if visible_ref_names.contains(name) =>
+                {
+                    stack.push(target.clone());
+                }
+                _ => {}
+            }
+        }
+
+        while let Some(commit_hash) = stack.pop() {
+            if !visible_commit_hashes.insert(commit_hash.clone()) {
+                continue;
+            }
+            if let Some(commit) = self.commit(&commit_hash) {
+                for parent_hash in &commit.parent_commit_hashes {
+                    stack.push(parent_hash.clone());
+                }
+            }
+        }
+
+        let filtered_commits: Vec<Commit> = self
+            .commit_hashes
+            .iter()
+            .filter(|hash| visible_commit_hashes.contains(*hash))
+            .filter_map(|hash| self.commit(hash).cloned())
+            .collect();
+
+        let filtered_commit_hashes = filtered_commits
+            .iter()
+            .map(|commit| commit.commit_hash.clone())
+            .collect();
+        let (parents_map, children_map) = build_commits_maps(&filtered_commits);
+        let commit_map = to_commit_map(filtered_commits);
+
+        let mut ref_map = RefMap::default();
+        for commit_hash in &visible_commit_hashes {
+            if let Some(refs) = self.ref_map.get(commit_hash) {
+                let filtered_refs: Vec<Ref> = refs
+                    .iter()
+                    .filter(|reference| match reference {
+                        Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } => {
+                            visible_ref_names.contains(name)
+                        }
+                        Ref::Tag { .. } | Ref::Stash { .. } => true,
+                    })
+                    .cloned()
+                    .collect();
+                if !filtered_refs.is_empty() {
+                    ref_map.insert(commit_hash.clone(), filtered_refs);
+                }
+            }
+        }
+
+        let head = match &self.head {
+            Head::Branch { name } if visible_local_branches.contains(name) => {
+                Head::Branch { name: name.clone() }
+            }
+            Head::Detached { target } if visible_commit_hashes.contains(target) => Head::Detached {
+                target: target.clone(),
+            },
+            _ => Head::None,
+        };
+
+        Self::new(
+            self.path.clone(),
+            commit_map,
+            parents_map,
+            children_map,
+            ref_map,
+            head,
+            filtered_commit_hashes,
+        )
     }
 
     pub fn commit_detail(&self, commit_hash: &CommitHash) -> (Commit, Vec<FileChange>) {

@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::{collections::HashSet, iter};
 
 use ratatui::{
     buffer::Buffer,
@@ -90,11 +91,20 @@ impl RefListState {
         (selected, opened)
     }
 
-    pub fn reset_tree_status(&mut self, selected: Vec<String>, opened: Vec<Vec<String>>) {
-        self.tree_state.select(selected);
-        for node in opened {
+    pub fn reset_tree_status(
+        &mut self,
+        refs: &[Ref],
+        selected: Vec<String>,
+        opened: Vec<Vec<String>>,
+    ) {
+        let valid_paths = collect_valid_tree_paths(refs);
+        let selected = sanitize_selected_path(selected, &valid_paths);
+
+        self.tree_state.close_all();
+        for node in opened.into_iter().filter(|node| valid_paths.contains(node)) {
             self.tree_state.open(node);
         }
+        self.tree_state.select(selected);
     }
 }
 
@@ -126,12 +136,68 @@ impl StatefulWidget for RefList {
             )
             .block(
                 Block::default()
-                    .borders(Borders::LEFT)
+                    .borders(Borders::RIGHT)
                     .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                     .padding(Padding::horizontal(1)),
             );
         tree.render(area, buf, &mut state.tree_state);
     }
+}
+
+fn collect_valid_tree_paths(refs: &[Ref]) -> HashSet<Vec<String>> {
+    let mut valid_paths = HashSet::from([
+        vec![TREE_BRANCH_ROOT_IDENT.into()],
+        vec![TREE_REMOTE_ROOT_IDENT.into()],
+        vec![TREE_TAG_ROOT_IDENT.into()],
+        vec![TREE_STASH_ROOT_IDENT.into()],
+    ]);
+
+    for r in refs {
+        match r {
+            Ref::Branch { name, .. } => {
+                add_ref_path(&mut valid_paths, TREE_BRANCH_ROOT_IDENT, name);
+            }
+            Ref::RemoteBranch { name, .. } => {
+                add_ref_path(&mut valid_paths, TREE_REMOTE_ROOT_IDENT, name);
+            }
+            Ref::Tag { name, .. } => {
+                valid_paths.insert(vec![TREE_TAG_ROOT_IDENT.into(), name.clone()]);
+            }
+            Ref::Stash { name, .. } => {
+                valid_paths.insert(vec![TREE_STASH_ROOT_IDENT.into(), name.clone()]);
+            }
+        }
+    }
+
+    valid_paths
+}
+
+fn add_ref_path(valid_paths: &mut HashSet<Vec<String>>, root: &str, name: &str) {
+    let mut path = vec![root.to_string()];
+    let mut identifier = String::new();
+    for part in name.split('/') {
+        if identifier.is_empty() {
+            identifier = part.to_string();
+        } else {
+            identifier = format!("{identifier}/{part}");
+        }
+        path.push(identifier.clone());
+        valid_paths.insert(path.clone());
+    }
+}
+
+fn sanitize_selected_path(
+    selected: Vec<String>,
+    valid_paths: &HashSet<Vec<String>>,
+) -> Vec<String> {
+    for idx in (1..=selected.len()).rev() {
+        let candidate = selected[..idx].to_vec();
+        if valid_paths.contains(&candidate) {
+            return candidate;
+        }
+    }
+
+    iter::once(TREE_BRANCH_ROOT_IDENT.to_string()).collect()
 }
 
 fn build_ref_tree_items(refs: &[Ref], color_theme: &ColorTheme) -> Vec<TreeItem<'static, String>> {

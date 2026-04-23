@@ -315,9 +315,13 @@ impl App<'_> {
                     self.close_user_command();
                 }
                 AppEvent::OpenRefs => {
+                    self.clear_image(None)?;
+                    terminal.clear()?;
                     self.open_refs();
                 }
                 AppEvent::CloseRefs => {
+                    self.clear_image(None)?;
+                    terminal.clear()?;
                     self.close_refs();
                 }
                 AppEvent::OpenHelp => {
@@ -920,6 +924,7 @@ impl App<'_> {
         self.success_notification(format!(
             "Base branch for '{current_branch}' set to '{base_branch}'"
         ));
+        self.view.refresh();
         Ok(())
     }
 
@@ -939,6 +944,7 @@ impl App<'_> {
         state.set_branch_prefix(Some(prefix));
         self.save_repo_state(&state)?;
         self.success_notification(format!("Branch prefix set to '{prefix}'"));
+        self.view.refresh();
         Ok(())
     }
 

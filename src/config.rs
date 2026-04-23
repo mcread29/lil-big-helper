@@ -349,6 +349,7 @@ pub struct UiListConfig {
     #[default(vec![
         UserListColumnType::Graph,
         UserListColumnType::Marker,
+        UserListColumnType::Status,
         UserListColumnType::Subject,
         UserListColumnType::Name,
         UserListColumnType::Hash,
@@ -377,6 +378,7 @@ pub struct UiListConfig {
 pub enum UserListColumnType {
     Graph,
     Marker,
+    Status,
     Subject,
     Name,
     Hash,
@@ -501,6 +503,7 @@ mod tests {
                     columns: vec![
                         UserListColumnType::Graph,
                         UserListColumnType::Marker,
+                        UserListColumnType::Status,
                         UserListColumnType::Subject,
                         UserListColumnType::Name,
                         UserListColumnType::Hash,
@@ -756,6 +759,7 @@ mod tests {
                     columns: vec![
                         UserListColumnType::Graph,
                         UserListColumnType::Marker,
+                        UserListColumnType::Status,
                         UserListColumnType::Subject,
                         UserListColumnType::Name,
                         UserListColumnType::Hash,

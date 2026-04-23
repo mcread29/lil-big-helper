@@ -1,4 +1,7 @@
-use std::rc::Rc;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    rc::Rc,
+};
 
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use laurier::highlight::highlight_matched_text;
@@ -25,6 +28,7 @@ use crate::{
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default().respect_case());
 
 const ELLIPSIS: &str = "...";
+const STATUS_COLUMN_WIDTH: u16 = 15;
 
 #[derive(Debug)]
 pub struct CommitInfo<'a> {
@@ -691,6 +695,9 @@ impl<'a> StatefulWidget for CommitList<'a> {
                 UserListColumnType::Marker => {
                     self.render_marker(buf, chunks[i], state);
                 }
+                UserListColumnType::Status => {
+                    self.render_status(buf, chunks[i], state);
+                }
                 UserListColumnType::Subject => {
                     self.render_subject(buf, chunks[i], state);
                 }
@@ -770,16 +777,8 @@ impl CommitList<'_> {
         let items: Vec<ListItem> = self
             .rendering_commit_info_iter(state)
             .map(|(i, commit_info)| {
-                let mut spans = refs_spans(
-                    commit_info,
-                    state.head,
-                    &state.search_matches[state.offset + i].refs,
-                    &self.ctx.color_theme,
-                );
-                let ref_spans_width: usize = spans.iter().map(|s| s.width()).sum();
-                let max_width = max_width.saturating_sub(ref_spans_width);
                 let commit = commit_info.commit;
-                if max_width > ELLIPSIS.len() {
+                let spans = if max_width > ELLIPSIS.len() {
                     let truncate = console::measure_text_width(&commit.subject) > max_width;
                     let subject = if truncate {
                         console::truncate_str(&commit.subject, max_width, ELLIPSIS).to_string()
@@ -787,22 +786,40 @@ impl CommitList<'_> {
                         commit.subject.to_string()
                     };
 
-                    let sub_spans =
-                        if let Some(pos) = state.search_matches[state.offset + i].subject.clone() {
-                            highlighted_spans(
-                                subject.into(),
-                                pos,
-                                self.ctx.color_theme.list_subject_fg,
-                                Modifier::empty(),
-                                &self.ctx.color_theme,
-                                truncate,
-                            )
-                        } else {
-                            vec![subject.fg(self.ctx.color_theme.list_subject_fg)]
-                        };
+                    if let Some(pos) = state.search_matches[state.offset + i].subject.clone() {
+                        highlighted_spans(
+                            subject.into(),
+                            pos,
+                            commit_info.graph_color,
+                            Modifier::empty(),
+                            &self.ctx.color_theme,
+                            truncate,
+                        )
+                    } else {
+                        vec![subject.fg(commit_info.graph_color)]
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.to_commit_list_item(i, spans, state)
+            })
+            .collect();
+        Widget::render(List::new(items), area, buf);
+    }
 
-                    spans.extend(sub_spans)
-                }
+    fn render_status(&self, buf: &mut Buffer, area: Rect, state: &CommitListState) {
+        if area.is_empty() {
+            return;
+        }
+        let items: Vec<ListItem> = self
+            .rendering_commit_info_iter(state)
+            .map(|(i, commit_info)| {
+                let spans = status_spans(
+                    commit_info,
+                    state.head,
+                    &state.search_matches[state.offset + i].refs,
+                    &self.ctx.color_theme,
+                );
                 self.to_commit_list_item(i, spans, state)
             })
             .collect();
@@ -828,13 +845,13 @@ impl CommitList<'_> {
                         highlighted_spans(
                             name.into(),
                             pos,
-                            self.ctx.color_theme.list_name_fg,
+                            author_color(commit),
                             Modifier::empty(),
                             &self.ctx.color_theme,
                             truncate,
                         )
                     } else {
-                        vec![name.fg(self.ctx.color_theme.list_name_fg)]
+                        vec![name.fg(author_color(commit))]
                     };
                 self.to_commit_list_item(i, spans, state)
             })
@@ -855,13 +872,13 @@ impl CommitList<'_> {
                         highlighted_spans(
                             hash.into(),
                             pos,
-                            self.ctx.color_theme.list_hash_fg,
+                            state.commits[state.offset + i].graph_color,
                             Modifier::empty(),
                             &self.ctx.color_theme,
                             false,
                         )
                     } else {
-                        vec![hash.fg(self.ctx.color_theme.list_hash_fg)]
+                        vec![hash.fg(state.commits[state.offset + i].graph_color)]
                     };
                 self.to_commit_list_item(i, spans, state)
             })
@@ -935,7 +952,7 @@ impl CommitList<'_> {
     }
 }
 
-fn refs_spans<'a>(
+fn status_spans<'a>(
     commit_info: &'a CommitInfo,
     head: &'a Head,
     refs_matches: &'a FxHashMap<String, SearchMatchPosition>,
@@ -945,10 +962,7 @@ fn refs_spans<'a>(
 
     if refs.len() == 1 {
         if let Ref::Stash { name, .. } = refs[0] {
-            return vec![
-                Span::raw(name).fg(color_theme.list_ref_stash_fg).bold(),
-                Span::raw(" "),
-            ];
+            return vec![Span::raw(name).fg(commit_info.graph_color).bold()];
         }
     }
 
@@ -987,13 +1001,13 @@ fn refs_spans<'a>(
         })
         .collect();
 
-    let mut spans = vec![Span::raw("(").fg(color_theme.list_ref_paren_fg).bold()];
+    let mut spans = Vec::new();
 
     if let Head::Detached { target } = head {
         if commit_info.commit.commit_hash == *target {
-            spans.push(Span::raw("HEAD").fg(color_theme.list_head_fg).bold());
+            spans.push(Span::raw("HEAD").fg(commit_info.graph_color).bold());
             if !ref_spans.is_empty() {
-                spans.push(Span::raw(", ").fg(color_theme.list_ref_paren_fg).bold());
+                spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
             }
         }
     }
@@ -1002,22 +1016,38 @@ fn refs_spans<'a>(
         let (ref_spans, ref_name) = ss;
         if let Head::Branch { name } = head {
             if ref_name == name {
-                spans.push(Span::raw("HEAD -> ").fg(color_theme.list_head_fg).bold());
+                spans.push(Span::raw("HEAD -> ").fg(commit_info.graph_color).bold());
             }
         }
         spans.extend(ref_spans);
         if i < refs.len() - 1 {
-            spans.push(Span::raw(", ").fg(color_theme.list_ref_paren_fg).bold());
+            spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
         }
     }
 
-    spans.push(Span::raw(") ").fg(color_theme.list_ref_paren_fg).bold());
-
-    if spans.len() == 2 {
-        spans.clear(); // contains only "(" and ")", so clear it
-    }
-
     spans
+}
+
+fn author_color(commit: &Commit) -> Color {
+    const AUTHOR_COLORS: [Color; 8] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::LightCyan,
+        Color::LightGreen,
+        Color::LightYellow,
+    ];
+
+    let identity = if commit.author_email.is_empty() {
+        &commit.author_name
+    } else {
+        &commit.author_email
+    };
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    AUTHOR_COLORS[(hasher.finish() as usize) % AUTHOR_COLORS.len()]
 }
 
 fn highlighted_spans(
@@ -1055,10 +1085,11 @@ fn calc_cell_widths(
     let (
         mut graph_cell_width,
         mut marker_cell_width,
+        mut status_cell_width,
         mut name_cell_width,
         mut hash_cell_width,
         mut date_cell_width,
-    ) = (0, 0, 0, 0, 0);
+    ) = (0, 0, 0, 0, 0, 0);
 
     for col in columns {
         match col {
@@ -1067,6 +1098,9 @@ fn calc_cell_widths(
             }
             UserListColumnType::Marker => {
                 marker_cell_width = 1;
+            }
+            UserListColumnType::Status => {
+                status_cell_width = STATUS_COLUMN_WIDTH;
             }
             UserListColumnType::Name => {
                 name_cell_width = name_width + pad;
@@ -1083,6 +1117,7 @@ fn calc_cell_widths(
 
     let mut total_width = graph_cell_width
         + marker_cell_width
+        + status_cell_width
         + hash_cell_width
         + name_cell_width
         + date_cell_width
@@ -1097,7 +1132,11 @@ fn calc_cell_widths(
         date_cell_width = 0;
     }
     if total_width > area_width {
+        total_width = total_width.saturating_sub(hash_cell_width);
         hash_cell_width = 0;
+    }
+    if total_width > area_width {
+        status_cell_width = 0;
     }
 
     let mut constraints = Vec::new();
@@ -1108,6 +1147,9 @@ fn calc_cell_widths(
             }
             UserListColumnType::Marker => {
                 constraints.push(Constraint::Length(marker_cell_width));
+            }
+            UserListColumnType::Status => {
+                constraints.push(Constraint::Length(status_cell_width));
             }
             UserListColumnType::Subject => {
                 constraints.push(Constraint::Min(0));
@@ -1140,6 +1182,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1158,6 +1201,7 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),  // Graph
             Constraint::Length(1),  // Marker
+            Constraint::Length(15), // Status
             Constraint::Min(0),     // Subject
             Constraint::Length(12), // Name (10 + 2 pad)
             Constraint::Length(9),  // Hash (7 + 2 pad)
@@ -1176,6 +1220,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1191,15 +1236,16 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject + Hash = 6 + 1 + 20 + 9 = 36 > 30
-        // => Name, Date, and Hash are removed
+        // Graph + Marker + Subject = 6 + 1 + 20 = 27 <= 30.
+        // Status, Name, Date, and Hash are removed in that order.
         let expected = vec![
-            Constraint::Length(6), // Graph
-            Constraint::Length(1), // Marker
-            Constraint::Min(0),    // Subject
-            Constraint::Length(0), // Name removed
-            Constraint::Length(0), // Hash removed
-            Constraint::Length(0), // Date removed
+            Constraint::Length(6),  // Graph
+            Constraint::Length(1),  // Marker
+            Constraint::Length(0),  // Status removed
+            Constraint::Min(0),     // Subject
+            Constraint::Length(0),  // Name removed
+            Constraint::Length(0),  // Hash removed
+            Constraint::Length(0),  // Date removed
         ];
         assert_eq!(actual, expected);
     }
@@ -1214,6 +1260,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1229,16 +1276,15 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject + Hash = 6 + 1 + 20 + 9 = 36
-        // Graph + Marker + Subject + Date + Hash = 6 + 1 + 20 + 17 + 9 = 53 > 40
-        // => Name and Date are removed
+        // Status, Name, Date, and Hash are removed to preserve the subject minimum.
         let expected = vec![
-            Constraint::Length(6), // Graph
-            Constraint::Length(1), // Marker
-            Constraint::Min(0),    // Subject
-            Constraint::Length(0), // Name removed
-            Constraint::Length(9), // Hash (7 + 2 pad)
-            Constraint::Length(0), // Date removed
+            Constraint::Length(6),  // Graph
+            Constraint::Length(1),  // Marker
+            Constraint::Length(0),  // Status removed
+            Constraint::Min(0),     // Subject
+            Constraint::Length(0),  // Name removed
+            Constraint::Length(0),  // Hash removed
+            Constraint::Length(0),  // Date removed
         ];
         assert_eq!(actual, expected);
     }
@@ -1253,6 +1299,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1268,16 +1315,49 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject + Date + Hash = 6 + 1 + 20 + 17 + 9 = 53 <= 60
-        // Graph + Marker + Subject + Name + Date + Hash = 6 + 1 + 20 + 12 + 17 + 9 = 65 > 60
-        // => Name is removed
+        // Name and Date are removed; status and hash still fit.
         let expected = vec![
             Constraint::Length(6),  // Graph
             Constraint::Length(1),  // Marker
+            Constraint::Length(15), // Status kept
             Constraint::Min(0),     // Subject
             Constraint::Length(0),  // Name removed
             Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(17), // Date (15 + 2 pad)
+            Constraint::Length(0),  // Date removed
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_calc_cell_width_keeps_status_when_space_allows() {
+        let area_width = 70;
+        let subject_min_width = 20;
+        let graph_width = 6;
+        let name_width = 10;
+        let date_width = 15;
+        let columns = vec![
+            UserListColumnType::Graph,
+            UserListColumnType::Marker,
+            UserListColumnType::Status,
+            UserListColumnType::Subject,
+            UserListColumnType::Hash,
+        ];
+
+        let actual = calc_cell_widths(
+            area_width,
+            subject_min_width,
+            graph_width,
+            name_width,
+            date_width,
+            &columns,
+        );
+
+        let expected = vec![
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(15),
+            Constraint::Min(0),
+            Constraint::Length(9),
         ];
         assert_eq!(actual, expected);
     }
@@ -1291,6 +1371,7 @@ mod tests {
         let date_width = 15;
         let columns = vec![
             UserListColumnType::Date,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Hash,
             UserListColumnType::Graph,
@@ -1307,6 +1388,7 @@ mod tests {
 
         let expected = vec![
             Constraint::Length(17), // Date (15 + 2 pad)
+            Constraint::Length(15), // Status
             Constraint::Min(0),     // Subject
             Constraint::Length(9),  // Hash (7 + 2 pad)
             Constraint::Length(6),  // Graph

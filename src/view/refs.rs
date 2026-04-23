@@ -104,14 +104,14 @@ impl<'a> RefsView<'a> {
         let refs_width =
             (area.width.saturating_sub(graph_width)).min(self.ctx.ui_config.refs.width);
 
-        let [list_area, refs_area] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(refs_width)]).areas(area);
-
-        let commit_list = CommitList::new(self.ctx.clone());
-        f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
+        let [refs_area, list_area] =
+            Layout::horizontal([Constraint::Length(refs_width), Constraint::Min(0)]).areas(area);
 
         let ref_list = RefList::new(&self.refs, self.ctx.clone());
         f.render_stateful_widget(ref_list, refs_area, &mut self.ref_list_state);
+
+        let commit_list = CommitList::new(self.ctx.clone());
+        f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
     }
 }
 
@@ -162,7 +162,10 @@ impl<'a> RefsView<'a> {
     }
 
     pub fn reset_refs_with(&mut self, refs_context: RefsRefreshViewContext) {
-        self.ref_list_state
-            .reset_tree_status(refs_context.selected, refs_context.opened);
+        self.ref_list_state.reset_tree_status(
+            &self.refs,
+            refs_context.selected,
+            refs_context.opened,
+        );
     }
 }

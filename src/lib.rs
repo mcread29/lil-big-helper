@@ -19,6 +19,7 @@ use std::{path::Path, rc::Rc};
 use app::{App, Ret};
 use clap::{Parser, ValueEnum};
 use graph::GraphImageManager;
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 /// lil-big-helper - A git helper with a rich commit graph in your terminal
@@ -161,6 +162,9 @@ pub fn run() -> Result<()> {
 
     let ret = loop {
         let repository = git::Repository::load(Path::new("."), order, max_count)?;
+        let repository = repository_filter_scope(&ctx.core_config.git_helper)
+            .map(|scope| repository.filtered_for_branch_scope(&scope))
+            .unwrap_or(repository);
 
         let graph = graph::calc_graph(&repository);
 
@@ -206,4 +210,22 @@ pub fn run() -> Result<()> {
 
     ratatui::restore();
     ret.map_err(Into::into)
+}
+
+fn repository_filter_scope(config: &config::GitHelperConfig) -> Option<git::BranchScope> {
+    let current_branch = git::get_current_branch(Path::new("."))?;
+    let git_dir = git::get_git_dir(Path::new("."))?;
+    let state = repo_state::load_repo_state(&git_dir).ok()?;
+    let base_branch = state.get_branch_origin(&current_branch)?.to_string();
+    let branch_prefix = state
+        .get_branch_prefix()
+        .map(str::to_string)
+        .unwrap_or_else(|| config.branch_prefix.clone());
+
+    Some(git::BranchScope {
+        current_branch: Some(current_branch),
+        base_branch,
+        branch_prefix,
+        branch_origins: FxHashMap::from_iter(state.branch_origins),
+    })
 }
