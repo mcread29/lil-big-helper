@@ -145,6 +145,7 @@ impl BranchVisuals {
         Span::raw(REMOTE_ICON).fg(color).bold()
     }
 
+    #[cfg(test)]
     pub fn remote_spacing<'a>(&self, color: Color) -> Span<'a> {
         Span::raw(" ").fg(color).bold()
     }

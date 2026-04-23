@@ -29,7 +29,7 @@ use crate::{
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default().respect_case());
 
 const ELLIPSIS: &str = "...";
-const STATUS_COLUMN_WIDTH: u16 = 20;
+const STATUS_COLUMN_WIDTH: u16 = 24;
 const FOCUSED_SELECTION_BG_FACTOR: f32 = 0.32;
 const UNFOCUSED_SELECTION_BG_FACTOR: f32 = 0.12;
 
@@ -135,6 +135,45 @@ impl SearchMatchPosition {
     fn new(matched_indices: Vec<usize>) -> Self {
         Self { matched_indices }
     }
+}
+
+#[derive(Debug, Clone)]
+struct BranchRefGroup {
+    visible_name: String,
+    fg: Color,
+    is_head: bool,
+    remote_names: Vec<String>,
+    ref_names: Vec<String>,
+}
+
+impl BranchRefGroup {
+    fn new(visible_name: String, fg: Color) -> Self {
+        Self {
+            visible_name,
+            fg,
+            is_head: false,
+            remote_names: Vec::new(),
+            ref_names: Vec::new(),
+        }
+    }
+
+    fn has_remote(&self) -> bool {
+        !self.remote_names.is_empty()
+    }
+
+    fn remote_suffix(&self) -> Option<String> {
+        if self.remote_names.len() <= 1 {
+            return None;
+        }
+
+        Some(format!("{{{}}}", self.remote_names.join(",")))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OrderedRef {
+    BranchGroup(usize),
+    Tag(String),
 }
 
 struct SearchMatcher {
@@ -990,105 +1029,65 @@ fn status_spans<'a>(
         }
     }
 
-    let local_branch_names = refs
-        .iter()
-        .filter_map(|reference| match reference {
-            Ref::Branch { .. } => branch_visuals.canonical_branch_name(reference),
-            _ => None,
-        })
-        .collect::<FxHashSet<_>>();
-    let mut duplicate_remote_icons = FxHashMap::default();
-    let mut ref_spans: Vec<(Vec<Span>, &String)> = Vec::new();
-    for reference in refs
-        .iter()
-        .filter(|reference| !matches!(reference, Ref::Stash { .. }))
-    {
-        let name = match reference {
-            Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } | Ref::Tag { name, .. } => {
-                name
-            }
-            Ref::Stash { .. } => continue,
-        };
-
-        let fg = match reference {
-            Ref::Branch { .. } | Ref::RemoteBranch { .. } => {
-                branch_visuals.color_for_ref(reference)
-            }
-            Ref::Tag { .. } => color_theme.list_ref_tag_fg,
-            Ref::Stash { .. } => continue,
-        };
-
-        if matches!(reference, Ref::RemoteBranch { .. }) {
-            let Some(canonical_name) = branch_visuals.canonical_branch_name(reference) else {
-                continue;
-            };
-            if local_branch_names.contains(&canonical_name) {
-                duplicate_remote_icons.insert(canonical_name, fg);
-                continue;
-            }
-        }
-
-        let spans = match reference {
-            Ref::Branch { .. } | Ref::RemoteBranch { .. } => display_branch_ref_spans(
-                branch_visuals,
-                reference,
-                name,
-                refs_matches.get(name),
-                fg,
-                color_theme,
-            ),
-            Ref::Tag { .. } => refs_matches
-                .get(name)
-                .and_then(|pos| display_match_position(name, name, pos))
-                .map(|pos| {
-                    highlighted_spans(
-                        Span::raw(name.clone()),
-                        pos,
-                        fg,
-                        Modifier::BOLD,
-                        color_theme,
-                        false,
-                    )
-                })
-                .unwrap_or_else(|| vec![Span::raw(name.clone()).fg(fg).bold()]),
-            Ref::Stash { .. } => continue,
-        };
-        ref_spans.push((spans, name));
-    }
+    let (branch_groups, ordered_refs) = group_branch_refs(refs, head, branch_visuals);
 
     let mut spans = Vec::new();
 
     if let Head::Detached { target } = head {
         if commit_info.commit.commit_hash == *target {
             spans.extend(branch_visuals.head_marker(None, false, commit_info.graph_color));
-            if !ref_spans.is_empty() {
+            if !ordered_refs.is_empty() {
                 spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
             }
         }
     }
 
-    let total_ref_spans = ref_spans.len();
-    for (i, ss) in ref_spans.into_iter().enumerate() {
-        let (ref_spans, ref_name) = ss;
-        let duplicate_remote_icon = duplicate_remote_icons
-            .get(ref_name.as_str())
-            .copied()
-            .map(|fg| remote_icon_only_spans(branch_visuals, fg));
-        if let Head::Branch { name } = head {
-            if ref_name == name {
-                spans.extend(branch_visuals.head_marker(Some(name), true, commit_info.graph_color));
-                if let Some(icon_spans) = duplicate_remote_icon.clone() {
-                    spans.extend(icon_spans);
-                }
-                if i + 1 < total_ref_spans {
-                    spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
-                }
-                continue;
+    let total_ref_spans = ordered_refs.len();
+    for (i, ordered_ref) in ordered_refs.iter().enumerate() {
+        match ordered_ref {
+            OrderedRef::BranchGroup(index) => {
+                let group = &branch_groups[*index];
+                let fg = if group.is_head {
+                    commit_info.graph_color
+                } else {
+                    group.fg
+                };
+                let pos = group
+                    .ref_names
+                    .iter()
+                    .find_map(|name| {
+                        refs_matches
+                            .get(name)
+                            .and_then(|match_pos| {
+                                display_match_position(name, &group.visible_name, match_pos)
+                            })
+                    });
+                spans.extend(display_branch_group_spans(
+                    branch_visuals,
+                    group,
+                    pos.as_ref(),
+                    fg,
+                    color_theme,
+                ));
             }
-        }
-        spans.extend(ref_spans);
-        if let Some(icon_spans) = duplicate_remote_icon {
-            spans.extend(icon_spans);
+            OrderedRef::Tag(name) => {
+                let fg = color_theme.list_ref_tag_fg;
+                let tag_spans = refs_matches
+                    .get(name)
+                    .and_then(|pos| display_match_position(name, name, pos))
+                    .map(|pos| {
+                        highlighted_spans(
+                            Span::raw(name.to_string()),
+                            pos,
+                            fg,
+                            Modifier::BOLD,
+                            color_theme,
+                            false,
+                        )
+                    })
+                    .unwrap_or_else(|| vec![Span::raw(name.to_string()).fg(fg).bold()]);
+                spans.extend(tag_spans);
+            }
         }
         if i + 1 < total_ref_spans {
             spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
@@ -1119,6 +1118,7 @@ fn display_match_position(
     }
 }
 
+#[cfg(test)]
 fn display_branch_ref_spans(
     branch_visuals: &BranchVisuals,
     reference: &Ref,
@@ -1156,16 +1156,101 @@ fn display_branch_ref_spans(
     spans
 }
 
-fn remote_icon_only_spans(branch_visuals: &BranchVisuals, fg: Color) -> Vec<Span<'static>> {
-    vec![
-        Span::raw(" ").fg(fg).bold(),
-        branch_visuals.remote_icon_marker(fg),
-    ]
+fn group_branch_refs(
+    refs: &[&Ref],
+    head: &Head,
+    branch_visuals: &BranchVisuals,
+) -> (Vec<BranchRefGroup>, Vec<OrderedRef>) {
+    let mut branch_groups = Vec::new();
+    let mut branch_group_indices = FxHashMap::default();
+    let mut ordered_refs = Vec::new();
+
+    for reference in refs
+        .iter()
+        .filter(|reference| !matches!(reference, Ref::Stash { .. }))
+    {
+        match reference {
+            Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } => {
+                let Some(canonical_name) = branch_visuals.canonical_branch_name(reference) else {
+                    continue;
+                };
+                let index = if let Some(index) = branch_group_indices.get(&canonical_name) {
+                    *index
+                } else {
+                    let index = branch_groups.len();
+                    branch_group_indices.insert(canonical_name, index);
+                    branch_groups.push(BranchRefGroup::new(
+                        branch_visuals.display_text(reference, true),
+                        branch_visuals.color_for_ref(reference),
+                    ));
+                    ordered_refs.push(OrderedRef::BranchGroup(index));
+                    index
+                };
+
+                let group = &mut branch_groups[index];
+                group.ref_names.push(name.clone());
+                if matches!(reference, Ref::Branch { .. }) {
+                    group.is_head |= branch_visuals.head_attached_to(head, reference);
+                    group.fg = branch_visuals.color_for_ref(reference);
+                } else if let Some((remote_name, _)) = name.split_once('/') {
+                    let remote_name = remote_name.to_string();
+                    if !group.remote_names.contains(&remote_name) {
+                        group.remote_names.push(remote_name);
+                    }
+                }
+            }
+            Ref::Tag { name, .. } => ordered_refs.push(OrderedRef::Tag(name.clone())),
+            Ref::Stash { .. } => {}
+        }
+    }
+
+    (branch_groups, ordered_refs)
+}
+
+fn display_branch_group_spans(
+    branch_visuals: &BranchVisuals,
+    group: &BranchRefGroup,
+    pos: Option<&SearchMatchPosition>,
+    fg: Color,
+    color_theme: &ColorTheme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if group.is_head {
+        spans.push(Span::raw("◎").fg(fg).bold());
+    }
+    if group.has_remote() {
+        spans.push(branch_visuals.remote_icon_marker(fg));
+    }
+    if group.is_head || group.has_remote() {
+        spans.push(Span::raw(" ").fg(fg).bold());
+    }
+
+    let visible_spans = pos
+        .cloned()
+        .map(|pos| {
+            highlighted_spans(
+                Span::raw(group.visible_name.clone()),
+                pos,
+                fg,
+                Modifier::BOLD,
+                color_theme,
+                false,
+            )
+        })
+        .unwrap_or_else(|| vec![Span::raw(group.visible_name.clone()).fg(fg).bold()]);
+    spans.extend(visible_spans);
+
+    if let Some(remote_suffix) = group.remote_suffix() {
+        spans.push(Span::raw(remote_suffix).fg(fg).bold());
+    }
+
+    spans
 }
 
 fn author_color(commit: &Commit) -> Color {
     let mut hasher = DefaultHasher::new();
-    commit.commit_hash.as_str().hash(&mut hasher);
+    commit.author_name.hash(&mut hasher);
+    commit.author_email.hash(&mut hasher);
     hashed_author_color(hasher.finish())
 }
 
@@ -1404,7 +1489,62 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>();
-        assert_eq!(contents, vec!["◎", " ", "audio-feedback", " ", "☁"]);
+        assert_eq!(contents, vec!["◎", "☁", " ", "audio-feedback"]);
+    }
+
+    #[test]
+    fn status_spans_show_remote_names_once_for_multiple_matching_remotes() {
+        let commit = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            ..Commit::default()
+        };
+        let branch = Ref::Branch {
+            name: "mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let origin_remote = Ref::RemoteBranch {
+            name: "origin/mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let backup_remote = Ref::RemoteBranch {
+            name: "backup/mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let commit_info = CommitInfo::new(
+            &commit,
+            vec![&branch, &origin_remote, &backup_remote],
+            Color::Green,
+        );
+        let branch_visuals = BranchVisuals {
+            ref_colors: FxHashMap::from_iter([
+                ("mason/audio-feedback".to_string(), Color::Green),
+                ("origin/mason/audio-feedback".to_string(), Color::Green),
+                ("backup/mason/audio-feedback".to_string(), Color::Green),
+            ]),
+            fallback_colors: vec![Color::Green],
+        };
+        let head = Head::Branch {
+            name: "mason/audio-feedback".into(),
+        };
+        let refs_matches = FxHashMap::default();
+        let color_theme = ColorTheme::default();
+
+        let spans = status_spans(
+            &commit_info,
+            &head,
+            &branch_visuals,
+            &refs_matches,
+            &color_theme,
+        );
+
+        let contents = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec!["◎", "☁", " ", "audio-feedback", "{origin,backup}"]
+        );
     }
 
     #[test]
@@ -1456,7 +1596,7 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(20),
+            Constraint::Length(24),
             Constraint::Min(0),
             Constraint::Length(12),
             Constraint::Length(0),
@@ -1570,9 +1710,9 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(20),
+            Constraint::Length(24),
             Constraint::Min(0),
-            Constraint::Length(12),
+            Constraint::Length(0),
             Constraint::Length(0),
             Constraint::Length(0),
         ];
@@ -1606,7 +1746,7 @@ mod tests {
         let expected = vec![
             Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(20),
+            Constraint::Length(24),
             Constraint::Min(0),
             Constraint::Length(0),
         ];
@@ -1639,7 +1779,7 @@ mod tests {
 
         let expected = vec![
             Constraint::Length(0),
-            Constraint::Length(20),
+            Constraint::Length(24),
             Constraint::Min(0),
             Constraint::Length(0),
             Constraint::Length(6),
@@ -1648,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn author_color_changes_between_commits() {
+    fn author_color_stays_stable_for_same_author() {
         let first = Commit {
             commit_hash: CommitHash::from("abc1234"),
             author_name: "Alice".into(),
@@ -1659,6 +1799,24 @@ mod tests {
             commit_hash: CommitHash::from("def5678"),
             author_name: "Alice".into(),
             author_email: "alice@example.com".into(),
+            ..Commit::default()
+        };
+
+        assert_eq!(author_color(&first), author_color(&second));
+    }
+
+    #[test]
+    fn author_color_changes_for_different_authors() {
+        let first = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            author_name: "Alice".into(),
+            author_email: "alice@example.com".into(),
+            ..Commit::default()
+        };
+        let second = Commit {
+            commit_hash: CommitHash::from("def5678"),
+            author_name: "Bob".into(),
+            author_email: "bob@example.com".into(),
             ..Commit::default()
         };
 
