@@ -5,24 +5,30 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
     text::Line,
-    widgets::{Block, Borders, Padding, Paragraph},
+    widgets::{Block, Paragraph},
     DefaultTerminal, Frame,
 };
 use rustc_hash::FxHashMap;
+use tui_input::{backend::crossterm::EventHandler, Input};
 
 use crate::{
     color::{ColorTheme, GraphColorSet},
-    config::{CoreConfig, CursorType, UiConfig, UserCommand, UserCommandType},
+    config::{CoreConfig, CursorType, GitHelperConfig, UiConfig, UserCommand, UserCommandType},
     event::{AppEvent, EventController, UserEvent, UserEventWithCount},
     external::{
         copy_to_clipboard, exec_user_command, exec_user_command_suspend, ExternalCommandParameters,
     },
-    git::{Commit, FileChange, Head, Ref, Repository},
+    git::{self, Commit, FileChange, Head, Ref, Repository},
     graph::{CellWidthType, Graph, GraphImageManager},
     keybind::KeyBind,
+    protection,
     protocol::ImageProtocol,
+    repo_state::{load_repo_state, save_repo_state},
     view::{RefreshViewContext, View},
-    widget::commit_list::{CommitInfo, CommitListState},
+    widget::{
+        branch_visual::BranchVisuals,
+        commit_list::{CommitInfo, CommitListState},
+    },
 };
 
 #[derive(Debug, Default)]
@@ -34,6 +40,26 @@ enum StatusLine {
     NotificationSuccess(String),
     NotificationWarn(String),
     NotificationError(String),
+}
+
+#[derive(Debug)]
+enum PromptKind {
+    ActionMenu,
+    CreateBranchBase,
+    CreateBranchSuffix { base_branch: String },
+    SwitchBranch,
+    SetBase,
+    SetBranchPrefix,
+}
+
+#[derive(Debug)]
+struct PromptState {
+    kind: PromptKind,
+    label: String,
+    input: Input,
+    transient: Option<String>,
+    selector_options: Vec<String>,
+    selector_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +91,7 @@ struct AppStatus {
     status_line: StatusLine,
     numeric_prefix: String,
     view_area: Rect,
+    prompt: Option<PromptState>,
 }
 
 #[derive(Debug)]
@@ -88,6 +115,7 @@ impl<'a> App<'a> {
         ec: &'a EventController,
         refresh_view_context: Option<RefreshViewContext>,
     ) -> Self {
+        let branch_visuals = BranchVisuals::new(repository, graph, graph_color_set).rc();
         let mut ref_name_to_commit_index_map = FxHashMap::default();
         let commits = graph
             .commits
@@ -113,18 +141,19 @@ impl<'a> App<'a> {
             graph_image_manager,
             graph_cell_width,
             head,
+            branch_visuals,
             ref_name_to_commit_index_map,
             ctx.core_config.search.ignore_case,
             ctx.core_config.search.fuzzy,
         );
-        if let InitialSelection::Head = initial_selection {
-            match repository.head() {
-                Head::Branch { name } => commit_list_state.select_ref(name),
-                Head::Detached { target } => commit_list_state.select_commit_hash(target),
-                Head::None => {}
-            }
+        let _ = initial_selection;
+        match repository.head() {
+            Head::Branch { name } => commit_list_state.select_ref(name),
+            Head::Detached { target } => commit_list_state.select_commit_hash(target),
+            Head::None => {}
         }
-        let view = View::of_list(commit_list_state, ctx.clone(), ec.sender());
+        let refs = repository.all_refs().into_iter().cloned().collect();
+        let view = View::of_list(commit_list_state, refs, ctx.clone(), ec.sender());
 
         let mut app = Self {
             repository,
@@ -152,6 +181,10 @@ impl App<'_> {
             terminal.draw(|f| self.render(f))?;
             match self.ec.recv() {
                 AppEvent::Key(key) => {
+                    if self.app_status.prompt.is_some() {
+                        self.handle_prompt_key(key);
+                        continue;
+                    }
                     match self.app_status.status_line {
                         StatusLine::None | StatusLine::Input(_, _, _) => {
                             // do nothing
@@ -170,6 +203,29 @@ impl App<'_> {
                     }
 
                     let user_event = self.ctx.keybind.get(&key);
+
+                    if self.view.captures_text_input() {
+                        match user_event {
+                            Some(UserEvent::ForceQuit) => {
+                                self.ec.send(AppEvent::Quit);
+                            }
+                            Some(UserEvent::StatusCommit) => {
+                                self.app_status.numeric_prefix.clear();
+                                self.view.handle_event(
+                                    UserEventWithCount::from_event(UserEvent::StatusCommit),
+                                    key,
+                                );
+                            }
+                            _ => {
+                                self.app_status.numeric_prefix.clear();
+                                self.view.handle_event(
+                                    UserEventWithCount::from_event(UserEvent::Unknown),
+                                    key,
+                                );
+                            }
+                        }
+                        continue;
+                    }
 
                     if let Some(UserEvent::Cancel) = user_event {
                         if !self.app_status.numeric_prefix.is_empty() {
@@ -190,6 +246,14 @@ impl App<'_> {
                             self.app_status.numeric_prefix.clear();
                         }
                         None => {
+                            if is_reverse_tab_key(key) {
+                                self.app_status.numeric_prefix.clear();
+                                self.view.handle_event(
+                                    UserEventWithCount::from_event(UserEvent::Unknown),
+                                    key,
+                                );
+                                continue;
+                            }
                             if let StatusLine::Input(_, _, _) = self.app_status.status_line {
                                 // In input mode, pass all key events to the view
                                 // fixme: currently, the only thing that processes key_event is searching the list,
@@ -216,6 +280,29 @@ impl App<'_> {
                 AppEvent::Quit => {
                     return Ok(Ret::Quit);
                 }
+                AppEvent::OpenActionMenu => {
+                    self.open_action_menu();
+                }
+                AppEvent::OpenCreateBranchPrompt => {
+                    self.open_create_branch_prompt();
+                }
+                AppEvent::OpenSwitchBranchPrompt => {
+                    self.open_switch_branch_prompt();
+                }
+                AppEvent::OpenSetBasePrompt => {
+                    self.open_set_base_prompt();
+                }
+                AppEvent::OpenSetBranchPrefixPrompt => {
+                    self.open_set_branch_prefix_prompt();
+                }
+                AppEvent::OpenStatus => {
+                    terminal.clear()?;
+                    self.open_status();
+                }
+                AppEvent::CloseStatus => {
+                    terminal.clear()?;
+                    self.close_status();
+                }
                 AppEvent::OpenDetail => {
                     self.clear_image(Some(terminal))?;
                     self.open_detail();
@@ -233,9 +320,13 @@ impl App<'_> {
                     self.close_user_command();
                 }
                 AppEvent::OpenRefs => {
+                    self.clear_image(Some(terminal))?;
+                    terminal.clear()?;
                     self.open_refs();
                 }
                 AppEvent::CloseRefs => {
+                    self.clear_image(Some(terminal))?;
+                    terminal.clear()?;
                     self.close_refs();
                 }
                 AppEvent::OpenHelp => {
@@ -280,6 +371,15 @@ impl App<'_> {
                 AppEvent::NotifyError(msg) => {
                     self.error_notification(msg);
                 }
+                AppEvent::PushCurrentBranch => {
+                    self.push_current_branch();
+                }
+                AppEvent::MergeBaseIntoCurrent => {
+                    self.merge_base_into_current();
+                }
+                AppEvent::InstallHook => {
+                    self.install_hook();
+                }
             }
         }
     }
@@ -291,7 +391,7 @@ impl App<'_> {
         f.render_widget(base, f.area());
 
         let [view_area, status_line_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(f.area());
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
 
         self.update_state(view_area);
 
@@ -340,16 +440,11 @@ impl App<'_> {
                 .add_modifier(Modifier::BOLD)
                 .fg(self.ctx.color_theme.status_error_fg),
         };
-        let paragraph = Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                .padding(Padding::horizontal(1)),
-        );
+        let paragraph = Paragraph::new(text);
         f.render_widget(paragraph, area);
 
         if let StatusLine::Input(_, Some(cursor_pos), _) = &self.app_status.status_line {
-            let (x, y) = (area.x + cursor_pos + 1, area.y + 1);
+            let (x, y) = (area.x + cursor_pos, area.y);
             match &self.ctx.ui_config.common.cursor_type {
                 CursorType::Native => {
                     f.set_cursor_position((x, y));
@@ -364,6 +459,500 @@ impl App<'_> {
 }
 
 impl App<'_> {
+    fn open_action_menu(&mut self) {
+        self.open_prompt(
+            PromptKind::ActionMenu,
+            "Action [b:create s:switch t:status a:base f:prefix p:push m:merge i:hook r:refresh]"
+                .into(),
+            None,
+            None,
+        );
+    }
+
+    fn open_create_branch_prompt(&mut self) {
+        if let Some(base_branch) = self.infer_base_branch_for_create() {
+            let prefix = self.current_branch_prefix();
+            self.open_prompt(
+                PromptKind::CreateBranchSuffix { base_branch },
+                format!("New branch suffix [{} / <name>]", prefix),
+                None,
+                None,
+            );
+            return;
+        }
+
+        let bases = self.git_helper_config().protected_base_branches.join(", ");
+        self.open_prompt(
+            PromptKind::CreateBranchBase,
+            "Base branch".into(),
+            Some(format!("Protected bases: {bases}")),
+            None,
+        );
+    }
+
+    fn open_switch_branch_prompt(&mut self) {
+        let branches = git::get_local_branches(std::path::Path::new(".")).join(", ");
+        self.open_prompt(
+            PromptKind::SwitchBranch,
+            "Switch branch".into(),
+            if branches.is_empty() {
+                None
+            } else {
+                Some(format!("Local branches: {branches}"))
+            },
+            None,
+        );
+    }
+
+    fn open_set_base_prompt(&mut self) {
+        let Some(branch) = git::get_current_branch(std::path::Path::new(".")) else {
+            self.error_notification("Not on a branch".into());
+            return;
+        };
+        let selector_options = git::get_local_branches(std::path::Path::new("."));
+        if selector_options.is_empty() {
+            self.error_notification("No local branches available to select as a base".into());
+            return;
+        }
+        let current_base = self
+            .load_repo_state()
+            .ok()
+            .and_then(|state| state.get_branch_origin(&branch).map(str::to_string))
+            .unwrap_or_else(|| "unset".into());
+        let selector_index = selector_options
+            .iter()
+            .position(|option| option == &current_base)
+            .unwrap_or(0);
+        let mut input = Input::default();
+        if let Some(current) = selector_options.get(selector_index) {
+            input = input.with_value(current.clone());
+        }
+        self.app_status.prompt = Some(PromptState {
+            kind: PromptKind::SetBase,
+            label: format!("Base branch for {branch}"),
+            input,
+            transient: Some(format!(
+                "Current: {current_base}. Select any local branch with left/right or j/k."
+            )),
+            selector_options,
+            selector_index,
+        });
+        self.refresh_prompt_status_line();
+    }
+
+    fn open_set_branch_prefix_prompt(&mut self) {
+        let current_prefix = self.current_branch_prefix();
+        let default_prefix = self.git_helper_config().branch_prefix.as_str();
+        self.open_prompt(
+            PromptKind::SetBranchPrefix,
+            "Branch prefix".into(),
+            Some(format!(
+                "Current: {current_prefix}. Default: {default_prefix}. Empty resets to default."
+            )),
+            Some(current_prefix),
+        );
+    }
+
+    fn open_prompt(
+        &mut self,
+        kind: PromptKind,
+        label: String,
+        transient: Option<String>,
+        initial_value: Option<String>,
+    ) {
+        let mut input = Input::default();
+        if let Some(value) = initial_value {
+            input = input.with_value(value);
+        }
+        self.app_status.prompt = Some(PromptState {
+            kind,
+            label,
+            input,
+            transient,
+            selector_options: Vec::new(),
+            selector_index: 0,
+        });
+        self.refresh_prompt_status_line();
+    }
+
+    fn refresh_prompt_status_line(&mut self) {
+        if let Some(prompt) = &self.app_status.prompt {
+            if prompt.selector_options.is_empty() {
+                let text = format!("{}: {}", prompt.label, prompt.input.value());
+                let cursor = text.len() as u16;
+                self.update_status_input(text, Some(cursor), prompt.transient.clone());
+            } else {
+                let current = prompt
+                    .selector_options
+                    .get(prompt.selector_index)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let text = format!("{}: < {} >", prompt.label, current);
+                self.update_status_input(text, None, prompt.transient.clone());
+            }
+        }
+    }
+
+    fn close_prompt(&mut self) {
+        self.app_status.prompt = None;
+        self.clear_status_line();
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_prompt();
+            }
+            KeyCode::Enter => {
+                self.submit_prompt();
+            }
+            _ => {
+                if let Some(prompt) = &mut self.app_status.prompt {
+                    if prompt.selector_options.is_empty() {
+                        prompt
+                            .input
+                            .handle_event(&ratatui::crossterm::event::Event::Key(key));
+                    } else {
+                        match key.code {
+                            KeyCode::Left
+                            | KeyCode::Up
+                            | KeyCode::BackTab
+                            | KeyCode::Char('h')
+                            | KeyCode::Char('k') => {
+                                if prompt.selector_index == 0 {
+                                    prompt.selector_index = prompt.selector_options.len() - 1;
+                                } else {
+                                    prompt.selector_index -= 1;
+                                }
+                            }
+                            KeyCode::Right
+                            | KeyCode::Down
+                            | KeyCode::Tab
+                            | KeyCode::Char('j')
+                            | KeyCode::Char('l') => {
+                                prompt.selector_index =
+                                    (prompt.selector_index + 1) % prompt.selector_options.len();
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.refresh_prompt_status_line();
+                }
+            }
+        }
+    }
+
+    fn submit_prompt(&mut self) {
+        let Some(prompt) = self.app_status.prompt.take() else {
+            return;
+        };
+        self.clear_status_line();
+
+        let value = if prompt.selector_options.is_empty() {
+            prompt.input.value().trim().to_string()
+        } else {
+            prompt
+                .selector_options
+                .get(prompt.selector_index)
+                .cloned()
+                .unwrap_or_default()
+        };
+        match prompt.kind {
+            PromptKind::ActionMenu => self.submit_action_menu(value.as_str()),
+            PromptKind::CreateBranchBase => {
+                if !self
+                    .git_helper_config()
+                    .protected_base_branches
+                    .iter()
+                    .any(|branch| branch == &value)
+                {
+                    self.error_notification(format!("Unknown protected base branch '{value}'"));
+                    return;
+                }
+                self.open_prompt(
+                    PromptKind::CreateBranchSuffix { base_branch: value },
+                    format!(
+                        "New branch suffix [{} / <name>]",
+                        self.current_branch_prefix()
+                    ),
+                    None,
+                    None,
+                );
+            }
+            PromptKind::CreateBranchSuffix { base_branch } => {
+                if let Err(err) = self.create_branch_from_base(&base_branch, value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+            PromptKind::SwitchBranch => {
+                if let Err(err) = self.switch_branch(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+            PromptKind::SetBase => {
+                if let Err(err) = self.set_current_branch_base(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+            PromptKind::SetBranchPrefix => {
+                if let Err(err) = self.set_branch_prefix_override(value.as_str()) {
+                    self.error_notification(err);
+                }
+            }
+        }
+    }
+
+    fn submit_action_menu(&mut self, value: &str) {
+        match value.chars().next() {
+            Some('b') => self.open_create_branch_prompt(),
+            Some('s') => self.open_switch_branch_prompt(),
+            Some('t') => self.open_status(),
+            Some('a') => self.open_set_base_prompt(),
+            Some('f') => self.open_set_branch_prefix_prompt(),
+            Some('p') => self.push_current_branch(),
+            Some('m') => self.merge_base_into_current(),
+            Some('i') => self.install_hook(),
+            Some('r') => self.view.refresh(),
+            Some(other) => self.error_notification(format!("Unknown action '{other}'")),
+            None => self.error_notification("No action selected".into()),
+        }
+    }
+
+    fn git_helper_config(&self) -> &GitHelperConfig {
+        &self.ctx.core_config.git_helper
+    }
+
+    fn load_repo_state(&self) -> Result<crate::repo_state::RepoState, String> {
+        let git_dir = git::get_git_dir(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+        load_repo_state(&git_dir).map_err(|err| err.to_string())
+    }
+
+    fn save_repo_state(&self, state: &crate::repo_state::RepoState) -> Result<(), String> {
+        let git_dir = git::get_git_dir(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+        save_repo_state(&git_dir, state).map_err(|err| err.to_string())
+    }
+
+    fn current_branch_prefix(&self) -> String {
+        self.load_repo_state()
+            .ok()
+            .and_then(|state| state.get_branch_prefix().map(str::to_string))
+            .unwrap_or_else(|| self.git_helper_config().branch_prefix.clone())
+    }
+
+    fn infer_base_branch_for_create(&self) -> Option<String> {
+        let protected = &self.git_helper_config().protected_base_branches;
+        if let Some(selected) = self.selected_commit_hash() {
+            for reference in self.repository.refs(&selected) {
+                if let Ref::Branch { name, .. } = reference {
+                    if protected.iter().any(|branch| branch == name) {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(current) = git::get_current_branch(std::path::Path::new(".")) {
+            if protected.iter().any(|branch| branch == &current) {
+                return Some(current);
+            }
+        }
+
+        if protected.len() == 1 {
+            return protected.first().cloned();
+        }
+
+        None
+    }
+
+    fn selected_commit_hash(&self) -> Option<crate::git::CommitHash> {
+        match &self.view {
+            View::List(view) => Some(view.as_list_state().selected_commit_hash().clone()),
+            View::Detail(view) => Some(view.as_list_state().selected_commit_hash().clone()),
+            View::UserCommand(view) => Some(view.as_list_state().selected_commit_hash().clone()),
+            _ => None,
+        }
+    }
+
+    fn ensure_base_worktree(&self, base_branch: &str) -> Result<std::path::PathBuf, String> {
+        let repo_root = git::get_repo_root(std::path::Path::new("."))
+            .ok_or_else(|| "Failed to resolve repository root".to_string())?;
+        let worktree_path = repo_root
+            .join(&self.git_helper_config().hidden_worktree_dir)
+            .join(base_branch);
+
+        if !worktree_path.exists() {
+            if let Some(parent) = worktree_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            }
+            git::add_hidden_base_worktree(std::path::Path::new("."), &worktree_path, base_branch)
+                .map_err(|err| err.to_string())?;
+        }
+
+        if git::get_current_branch(&worktree_path).as_deref() != Some(base_branch) {
+            return Err(format!(
+                "Hidden worktree '{}' is not checked out to '{}'",
+                worktree_path.display(),
+                base_branch
+            ));
+        }
+
+        if git::is_dirty(&worktree_path) {
+            return Err(format!(
+                "Hidden worktree '{}' is dirty",
+                worktree_path.display()
+            ));
+        }
+
+        git::refresh_hidden_base_worktree(&worktree_path, base_branch)
+            .map_err(|err| err.to_string())?;
+        Ok(worktree_path)
+    }
+
+    fn create_branch_from_base(&mut self, base_branch: &str, suffix: &str) -> Result<(), String> {
+        let suffix = suffix.trim().trim_matches('/');
+        if suffix.is_empty() {
+            return Err("Branch suffix cannot be empty".into());
+        }
+
+        self.ensure_base_worktree(base_branch)?;
+
+        let branch_name = format!("{}/{}", self.current_branch_prefix(), suffix);
+        git::create_branch(std::path::Path::new("."), &branch_name, base_branch)
+            .map_err(|err| err.to_string())?;
+        git::switch_branch(std::path::Path::new("."), &branch_name)
+            .map_err(|err| err.to_string())?;
+
+        let mut state = self.load_repo_state()?;
+        state.set_branch_origin(&branch_name, base_branch);
+        self.save_repo_state(&state)?;
+
+        self.view.refresh();
+        Ok(())
+    }
+
+    fn switch_branch(&mut self, branch: &str) -> Result<(), String> {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return Err("Branch name cannot be empty".into());
+        }
+
+        if git::is_dirty(std::path::Path::new(".")) {
+            let current = git::get_current_branch(std::path::Path::new("."))
+                .unwrap_or_else(|| "detached".into());
+            let message = format!(
+                "{}: {} -> {}",
+                self.git_helper_config().stash_message_prefix,
+                current,
+                branch
+            );
+            git::stash_push(std::path::Path::new("."), &message).map_err(|err| err.to_string())?;
+        }
+
+        git::switch_branch(std::path::Path::new("."), branch).map_err(|err| err.to_string())?;
+        self.view.refresh();
+        Ok(())
+    }
+
+    fn push_current_branch(&mut self) {
+        let result = (|| -> Result<(), String> {
+            let branch = git::get_current_branch(std::path::Path::new("."))
+                .ok_or_else(|| "Not on a branch".to_string())?;
+            let set_upstream = git::get_upstream_branch(std::path::Path::new(".")).is_none()
+                && self.git_helper_config().auto_set_upstream_on_first_push;
+            git::push(std::path::Path::new("."), "origin", &branch, set_upstream)
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.view.refresh(),
+            Err(err) => self.error_notification(err),
+        }
+    }
+
+    fn merge_base_into_current(&mut self) {
+        let result = (|| -> Result<(), String> {
+            if git::is_dirty(std::path::Path::new(".")) {
+                return Err("Worktree is dirty; stash or commit before merging base".into());
+            }
+
+            let branch = git::get_current_branch(std::path::Path::new("."))
+                .ok_or_else(|| "Not on a branch".to_string())?;
+            let state = self.load_repo_state()?;
+            let base_branch = state
+                .get_branch_origin(&branch)
+                .ok_or_else(|| format!("No base branch recorded for '{branch}'"))?
+                .to_string();
+
+            self.ensure_base_worktree(&base_branch)?;
+            git::merge_base_into_current(std::path::Path::new("."), &base_branch)
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.view.refresh(),
+            Err(err) => self.error_notification(err),
+        }
+    }
+
+    fn install_hook(&mut self) {
+        let result = (|| -> Result<(), String> {
+            let git_dir = git::get_git_dir(std::path::Path::new("."))
+                .ok_or_else(|| "Failed to resolve git dir".to_string())?;
+            protection::install_or_update_pre_commit_hook(&git_dir, self.git_helper_config())
+                .map_err(|err| err.to_string())
+        })();
+
+        match result {
+            Ok(()) => self.success_notification("Installed lil-big-helper pre-commit hook".into()),
+            Err(err) => self.error_notification(err),
+        }
+    }
+
+    fn set_current_branch_base(&mut self, base_branch: &str) -> Result<(), String> {
+        let base_branch = base_branch.trim();
+        if !git::get_local_branches(std::path::Path::new("."))
+            .iter()
+            .any(|branch| branch == base_branch)
+        {
+            return Err(format!("Unknown local branch '{base_branch}'"));
+        }
+
+        let current_branch = git::get_current_branch(std::path::Path::new("."))
+            .ok_or_else(|| "Not on a branch".to_string())?;
+        let mut state = self.load_repo_state()?;
+        state.set_branch_origin(&current_branch, base_branch);
+        self.save_repo_state(&state)?;
+        self.success_notification(format!(
+            "Base branch for '{current_branch}' set to '{base_branch}'"
+        ));
+        self.view.refresh();
+        Ok(())
+    }
+
+    fn set_branch_prefix_override(&mut self, prefix: &str) -> Result<(), String> {
+        let prefix = prefix.trim().trim_matches('/');
+        let mut state = self.load_repo_state()?;
+        if prefix.is_empty() {
+            state.set_branch_prefix(None);
+            self.save_repo_state(&state)?;
+            self.success_notification(format!(
+                "Branch prefix reset to default '{}'",
+                self.git_helper_config().branch_prefix
+            ));
+            return Ok(());
+        }
+
+        state.set_branch_prefix(Some(prefix));
+        self.save_repo_state(&state)?;
+        self.success_notification(format!("Branch prefix set to '{prefix}'"));
+        self.view.refresh();
+        Ok(())
+    }
+
     fn update_state(&mut self, view_area: Rect) {
         self.app_status.view_area = view_area;
     }
@@ -382,17 +971,21 @@ impl App<'_> {
     }
 
     fn open_detail(&mut self) {
-        let commit_list_state = match self.view {
-            View::List(ref mut view) => view.take_list_state(),
-            View::UserCommand(ref mut view) => view.take_list_state(),
+        let (commit_list_state, refs_context) = match self.view {
+            View::List(ref mut view) => (view.take_list_state(), Some(view.refs_context())),
+            View::UserCommand(ref mut view) => (view.take_list_state(), None),
             _ => return,
         };
-        let (commit, changes, refs) = selected_commit_details(self.repository, &commit_list_state);
+        let (commit, changes, commit_refs) =
+            selected_commit_details(self.repository, &commit_list_state);
+        let all_refs = self.repository.all_refs().into_iter().cloned().collect();
         self.view = View::of_detail(
             commit_list_state,
             commit,
             changes,
-            refs,
+            commit_refs,
+            all_refs,
+            refs_context,
             self.ctx.clone(),
             self.ec.sender(),
         );
@@ -400,8 +993,38 @@ impl App<'_> {
 
     fn close_detail(&mut self) {
         if let View::Detail(ref mut view) = self.view {
+            let refs_context = view.refs_context();
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
+            if let (Some(refs_context), View::List(ref mut view)) = (refs_context, &mut self.view) {
+                view.reset_refs_with(refs_context);
+            }
+        }
+    }
+
+    fn open_status(&mut self) {
+        let commit_list_state = match self.view {
+            View::List(ref mut view) => view.take_list_state(),
+            View::Detail(ref mut view) => view.take_list_state(),
+            View::UserCommand(ref mut view) => view.take_list_state(),
+            View::Refs(ref mut view) => view.take_list_state(),
+            View::Status(_) | View::Help(_) | View::Default => return,
+        };
+        let entries = git::get_status_entries(std::path::Path::new("."));
+        self.view = View::of_status(
+            commit_list_state,
+            entries,
+            self.ctx.clone(),
+            self.ec.sender(),
+        );
+    }
+
+    fn close_status(&mut self) {
+        if let View::Status(ref mut view) = self.view {
+            let commit_list_state = view.take_list_state();
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -543,7 +1166,8 @@ impl App<'_> {
     fn close_user_command(&mut self) {
         if let View::UserCommand(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -558,7 +1182,8 @@ impl App<'_> {
     fn close_refs(&mut self) {
         if let View::Refs(ref mut view) = self.view {
             let commit_list_state = view.take_list_state();
-            self.view = View::of_list(commit_list_state, self.ctx.clone(), self.ec.sender());
+            let refs = self.repository.all_refs().into_iter().cloned().collect();
+            self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
         }
     }
 
@@ -615,8 +1240,13 @@ impl App<'_> {
         }
         match context {
             RefreshViewContext::List { .. } => {}
-            RefreshViewContext::Detail { .. } => {
+            RefreshViewContext::Detail { refs_context, .. } => {
                 self.open_detail();
+                if let (Some(refs_context), View::Detail(ref mut view)) =
+                    (refs_context, &mut self.view)
+                {
+                    view.set_refs_context(Some(refs_context));
+                }
             }
             RefreshViewContext::UserCommand {
                 user_command_context,
@@ -625,9 +1255,14 @@ impl App<'_> {
                 self.open_user_command(user_command_context.n, None);
             }
             RefreshViewContext::Refs { refs_context, .. } => {
-                self.open_refs();
-                if let View::Refs(ref mut view) = self.view {
+                if let View::List(ref mut view) = self.view {
                     view.reset_refs_with(refs_context);
+                }
+            }
+            RefreshViewContext::Status { status_context, .. } => {
+                self.open_status();
+                if let View::Status(ref mut view) = self.view {
+                    view.reset_status_with(status_context);
                 }
             }
         }
@@ -700,6 +1335,14 @@ fn process_numeric_prefix(
     } else {
         UserEventWithCount::from_event(user_event)
     }
+}
+
+fn is_reverse_tab_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab
+            && key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::SHIFT))
 }
 
 fn extract_user_command_by_number(

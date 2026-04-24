@@ -1,15 +1,16 @@
 use std::rc::Rc;
+use std::{collections::HashSet, iter};
 
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Style, Stylize},
+    style::{Color, Style, Stylize},
     widgets::{Block, Borders, Padding, StatefulWidget},
 };
 use semver::Version;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
-use crate::{app::AppContext, color::ColorTheme, git::Ref};
+use crate::{app::AppContext, color::ColorTheme, git::Ref, widget::branch_visual::BranchVisuals};
 
 const TREE_BRANCH_ROOT_IDENT: &str = "__branches__";
 const TREE_REMOTE_ROOT_IDENT: &str = "__remotes__";
@@ -20,6 +21,8 @@ const TREE_BRANCH_ROOT_TEXT: &str = "Branches";
 const TREE_REMOTE_ROOT_TEXT: &str = "Remotes";
 const TREE_TAG_ROOT_TEXT: &str = "Tags";
 const TREE_STASH_ROOT_TEXT: &str = "Stashes";
+const FOCUSED_SELECTION_BG_FACTOR: f32 = 0.32;
+const UNFOCUSED_SELECTION_BG_FACTOR: f32 = 0.12;
 
 #[derive(Debug, Default)]
 pub struct RefListState {
@@ -33,9 +36,7 @@ impl RefListState {
         tree_state.open(vec![TREE_BRANCH_ROOT_IDENT.into()]);
         Self { tree_state }
     }
-}
 
-impl RefListState {
     pub fn select_next(&mut self) {
         self.tree_state.key_down();
     }
@@ -90,23 +91,69 @@ impl RefListState {
         (selected, opened)
     }
 
-    pub fn reset_tree_status(&mut self, selected: Vec<String>, opened: Vec<Vec<String>>) {
-        self.tree_state.select(selected);
-        for node in opened {
+    pub fn reset_tree_status(
+        &mut self,
+        refs: &[Ref],
+        selected: Vec<String>,
+        opened: Vec<Vec<String>>,
+    ) {
+        let valid_paths = collect_valid_tree_paths(refs);
+        let selected = sanitize_selected_path(selected, &valid_paths);
+
+        self.tree_state.close_all();
+        for node in opened.into_iter().filter(|node| valid_paths.contains(node)) {
             self.tree_state.open(node);
         }
+        self.tree_state.select(selected);
+    }
+
+    pub fn select_branch_name(&mut self, refs: &[Ref], branch_name: &str) {
+        let root = if refs
+            .iter()
+            .any(|reference| matches!(reference, Ref::Branch { name, .. } if name == branch_name))
+        {
+            TREE_BRANCH_ROOT_IDENT
+        } else {
+            TREE_REMOTE_ROOT_IDENT
+        };
+
+        let mut selected = vec![root.to_string()];
+        let mut identifier = String::new();
+        for part in branch_name.split('/') {
+            if identifier.is_empty() {
+                identifier = part.to_string();
+            } else {
+                identifier = format!("{identifier}/{part}");
+            }
+            selected.push(identifier.clone());
+            self.tree_state.open(selected.clone());
+        }
+
+        let valid_paths = collect_valid_tree_paths(refs);
+        self.tree_state
+            .select(sanitize_selected_path(selected, &valid_paths));
     }
 }
 
 pub struct RefList {
     items: Vec<TreeItem<'static, String>>,
     ctx: Rc<AppContext>,
+    focused: bool,
 }
 
 impl RefList {
-    pub fn new(refs: &[Ref], ctx: Rc<AppContext>) -> RefList {
-        let items = build_ref_tree_items(refs, &ctx.color_theme);
-        RefList { items, ctx }
+    pub fn new(
+        refs: &[Ref],
+        branch_visuals: Rc<BranchVisuals>,
+        ctx: Rc<AppContext>,
+        focused: bool,
+    ) -> RefList {
+        let items = build_ref_tree_items(refs, &branch_visuals, &ctx.color_theme);
+        RefList {
+            items,
+            ctx,
+            focused,
+        }
     }
 }
 
@@ -114,19 +161,28 @@ impl StatefulWidget for RefList {
     type State = RefListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let highlight_style = Style::default()
+            .bg(if self.focused {
+                dim_selection_color(
+                    self.ctx.color_theme.ref_selected_bg,
+                    FOCUSED_SELECTION_BG_FACTOR,
+                )
+            } else {
+                dim_selection_color(
+                    self.ctx.color_theme.ref_selected_bg,
+                    UNFOCUSED_SELECTION_BG_FACTOR,
+                )
+            })
+            .fg(self.ctx.color_theme.ref_selected_fg);
         let tree = Tree::new(&self.items)
             .unwrap()
-            .node_closed_symbol("\u{25b8} ") // ▸
-            .node_open_symbol("\u{25be} ") // ▾
+            .node_closed_symbol("\u{25b8} ")
+            .node_open_symbol("\u{25be} ")
             .node_no_children_symbol("  ")
-            .highlight_style(
-                Style::default()
-                    .bg(self.ctx.color_theme.ref_selected_bg)
-                    .fg(self.ctx.color_theme.ref_selected_fg),
-            )
+            .highlight_style(highlight_style)
             .block(
                 Block::default()
-                    .borders(Borders::LEFT)
+                    .borders(Borders::RIGHT)
                     .style(Style::default().fg(self.ctx.color_theme.divider_fg))
                     .padding(Padding::horizontal(1)),
             );
@@ -134,7 +190,95 @@ impl StatefulWidget for RefList {
     }
 }
 
-fn build_ref_tree_items(refs: &[Ref], color_theme: &ColorTheme) -> Vec<TreeItem<'static, String>> {
+fn dim_selection_color(color: Color, factor: f32) -> Color {
+    let (r, g, b) = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::DarkGray => (128, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::White => (255, 255, 255),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        other => return other,
+    };
+    Color::Rgb(
+        (r as f32 * factor) as u8,
+        (g as f32 * factor) as u8,
+        (b as f32 * factor) as u8,
+    )
+}
+
+fn collect_valid_tree_paths(refs: &[Ref]) -> HashSet<Vec<String>> {
+    let mut valid_paths = HashSet::from([
+        vec![TREE_BRANCH_ROOT_IDENT.into()],
+        vec![TREE_REMOTE_ROOT_IDENT.into()],
+        vec![TREE_TAG_ROOT_IDENT.into()],
+        vec![TREE_STASH_ROOT_IDENT.into()],
+    ]);
+
+    for r in refs {
+        match r {
+            Ref::Branch { name, .. } => {
+                add_ref_path(&mut valid_paths, TREE_BRANCH_ROOT_IDENT, name)
+            }
+            Ref::RemoteBranch { name, .. } => {
+                add_ref_path(&mut valid_paths, TREE_REMOTE_ROOT_IDENT, name)
+            }
+            Ref::Tag { name, .. } => {
+                valid_paths.insert(vec![TREE_TAG_ROOT_IDENT.into(), name.clone()]);
+            }
+            Ref::Stash { name, .. } => {
+                valid_paths.insert(vec![TREE_STASH_ROOT_IDENT.into(), name.clone()]);
+            }
+        }
+    }
+
+    valid_paths
+}
+
+fn add_ref_path(valid_paths: &mut HashSet<Vec<String>>, root: &str, name: &str) {
+    let mut path = vec![root.to_string()];
+    let mut identifier = String::new();
+    for part in name.split('/') {
+        if identifier.is_empty() {
+            identifier = part.to_string();
+        } else {
+            identifier = format!("{identifier}/{part}");
+        }
+        path.push(identifier.clone());
+        valid_paths.insert(path.clone());
+    }
+}
+
+fn sanitize_selected_path(
+    selected: Vec<String>,
+    valid_paths: &HashSet<Vec<String>>,
+) -> Vec<String> {
+    for idx in (1..=selected.len()).rev() {
+        let candidate = selected[..idx].to_vec();
+        if valid_paths.contains(&candidate) {
+            return candidate;
+        }
+    }
+
+    iter::once(TREE_BRANCH_ROOT_IDENT.to_string()).collect()
+}
+
+fn build_ref_tree_items(
+    refs: &[Ref],
+    branch_visuals: &BranchVisuals,
+    color_theme: &ColorTheme,
+) -> Vec<TreeItem<'static, String>> {
     let mut branch_refs = Vec::new();
     let mut remote_refs = Vec::new();
     let mut tag_refs = Vec::new();
@@ -159,35 +303,59 @@ fn build_ref_tree_items(refs: &[Ref], color_theme: &ColorTheme) -> Vec<TreeItem<
     sort_tag_tree_nodes(&mut tag_nodes);
     sort_stash_tree_nodes(&mut stash_nodes);
 
-    let branch_items = ref_tree_nodes_to_tree_items(branch_nodes, color_theme);
-    let remote_items = ref_tree_nodes_to_tree_items(remote_nodes, color_theme);
-    let tag_items = ref_tree_nodes_to_tree_items(tag_nodes, color_theme);
-    let stash_items = ref_tree_nodes_to_tree_items(stash_nodes, color_theme);
+    let branch_items = ref_tree_nodes_to_tree_items(
+        branch_nodes,
+        branch_visuals,
+        color_theme,
+        TreeNodeKind::Branch,
+    );
+    let remote_items = ref_tree_nodes_to_tree_items(
+        remote_nodes,
+        branch_visuals,
+        color_theme,
+        TreeNodeKind::RemoteBranch,
+    );
+    let tag_items =
+        ref_tree_nodes_to_tree_items(tag_nodes, branch_visuals, color_theme, TreeNodeKind::Other);
+    let stash_items = ref_tree_nodes_to_tree_items(
+        stash_nodes,
+        branch_visuals,
+        color_theme,
+        TreeNodeKind::Other,
+    );
 
     vec![
         tree_item(
             TREE_BRANCH_ROOT_IDENT.into(),
             TREE_BRANCH_ROOT_TEXT.into(),
             branch_items,
+            branch_visuals,
             color_theme,
+            TreeNodeKind::Other,
         ),
         tree_item(
             TREE_REMOTE_ROOT_IDENT.into(),
             TREE_REMOTE_ROOT_TEXT.into(),
             remote_items,
+            branch_visuals,
             color_theme,
+            TreeNodeKind::Other,
         ),
         tree_item(
             TREE_TAG_ROOT_IDENT.into(),
             TREE_TAG_ROOT_TEXT.into(),
             tag_items,
+            branch_visuals,
             color_theme,
+            TreeNodeKind::Other,
         ),
         tree_item(
             TREE_STASH_ROOT_IDENT.into(),
             TREE_STASH_ROOT_TEXT.into(),
             stash_items,
+            branch_visuals,
             color_theme,
+            TreeNodeKind::Other,
         ),
     ]
 }
@@ -198,17 +366,22 @@ struct RefTreeNode {
     children: Vec<RefTreeNode>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeNodeKind {
+    Branch,
+    RemoteBranch,
+    Other,
+}
+
 fn refs_to_stash_ref_tree_nodes(ref_name_messages: Vec<(String, String)>) -> Vec<RefTreeNode> {
-    let mut nodes: Vec<RefTreeNode> = Vec::new();
-    for (name, message) in ref_name_messages {
-        let node = RefTreeNode {
-            identifier: name.clone(),
-            name: message.to_string(),
+    ref_name_messages
+        .into_iter()
+        .map(|(name, message)| RefTreeNode {
+            identifier: name,
+            name: message,
             children: Vec::new(),
-        };
-        nodes.push(node);
-    }
-    nodes
+        })
+        .collect()
 }
 
 fn refs_to_ref_tree_nodes(ref_names: Vec<String>) -> Vec<RefTreeNode> {
@@ -231,12 +404,11 @@ fn refs_to_ref_tree_nodes(ref_names: Vec<String>) -> Vec<RefTreeNode> {
                 } else {
                     format!("{parent_identifier}/{part}")
                 };
-                let node = RefTreeNode {
+                current_nodes.push(RefTreeNode {
                     identifier: identifier.clone(),
                     name: part.to_string(),
                     children: Vec::new(),
-                };
-                current_nodes.push(node);
+                });
                 current_nodes = current_nodes.last_mut().unwrap().children.as_mut();
                 parent_identifier = identifier;
             }
@@ -248,15 +420,31 @@ fn refs_to_ref_tree_nodes(ref_names: Vec<String>) -> Vec<RefTreeNode> {
 
 fn ref_tree_nodes_to_tree_items(
     nodes: Vec<RefTreeNode>,
+    branch_visuals: &BranchVisuals,
     color_theme: &ColorTheme,
+    kind: TreeNodeKind,
 ) -> Vec<TreeItem<'static, String>> {
     let mut items = Vec::new();
     for node in nodes {
         if node.children.is_empty() {
-            items.push(tree_leaf_item(node.identifier, node.name, color_theme));
+            items.push(tree_leaf_item(
+                node.identifier,
+                node.name,
+                branch_visuals,
+                color_theme,
+                kind,
+            ));
         } else {
-            let children = ref_tree_nodes_to_tree_items(node.children, color_theme);
-            items.push(tree_item(node.identifier, node.name, children, color_theme));
+            let children =
+                ref_tree_nodes_to_tree_items(node.children, branch_visuals, color_theme, kind);
+            items.push(tree_item(
+                node.identifier,
+                node.name,
+                children,
+                branch_visuals,
+                color_theme,
+                kind,
+            ));
         }
     }
     items
@@ -279,11 +467,8 @@ fn sort_tag_tree_nodes(nodes: &mut [RefTreeNode]) {
         let a_version = parse_semantic_version_tag(&a.name);
         let b_version = parse_semantic_version_tag(&b.name);
         if a_version.is_none() && b_version.is_none() {
-            // if both are not semantic versions, sort by name asc
             a.name.cmp(&b.name)
         } else {
-            // if both are semantic versions, sort by version desc
-            // if only one is a semantic version, it will be sorted first
             b_version.cmp(&a_version)
         }
     });
@@ -302,15 +487,166 @@ fn tree_item(
     identifier: String,
     name: String,
     children: Vec<TreeItem<'static, String>>,
+    branch_visuals: &BranchVisuals,
     color_theme: &ColorTheme,
+    kind: TreeNodeKind,
 ) -> TreeItem<'static, String> {
-    TreeItem::new(identifier, name.fg(color_theme.fg), children).unwrap()
+    let color = tree_item_color(&identifier, branch_visuals, color_theme, kind);
+    TreeItem::new(identifier, name.fg(color), children).unwrap()
 }
 
 fn tree_leaf_item(
     identifier: String,
     name: String,
+    branch_visuals: &BranchVisuals,
     color_theme: &ColorTheme,
+    kind: TreeNodeKind,
 ) -> TreeItem<'static, String> {
-    tree_item(identifier, name, Vec::new(), color_theme)
+    tree_item(
+        identifier,
+        name,
+        Vec::new(),
+        branch_visuals,
+        color_theme,
+        kind,
+    )
+}
+
+fn tree_item_color(
+    identifier: &str,
+    branch_visuals: &BranchVisuals,
+    color_theme: &ColorTheme,
+    kind: TreeNodeKind,
+) -> Color {
+    match kind {
+        TreeNodeKind::Branch => branch_visuals.color_for_name(identifier),
+        TreeNodeKind::RemoteBranch if identifier.contains('/') => {
+            branch_visuals.color_for_name(identifier)
+        }
+        TreeNodeKind::RemoteBranch => color_theme.fg,
+        TreeNodeKind::Other => color_theme.fg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use chrono::DateTime;
+    use rustc_hash::FxHashMap;
+
+    use super::*;
+    use crate::{
+        color::{GraphColor, GraphColorSet},
+        git::{Commit, CommitHash, Head, Repository},
+        graph::Graph,
+    };
+
+    fn commit(hash: &str) -> Commit {
+        Commit {
+            commit_hash: CommitHash::from(hash),
+            author_date: DateTime::parse_from_rfc3339("2026-04-23T00:00:00+00:00").unwrap(),
+            committer_date: DateTime::parse_from_rfc3339("2026-04-23T00:00:00+00:00").unwrap(),
+            ..Commit::default()
+        }
+    }
+
+    fn branch_visuals() -> BranchVisuals {
+        let commit = commit("0123456789abcdef0123456789abcdef01234567");
+        let commit_hash = commit.commit_hash.clone();
+        let repository = Repository::new(
+            PathBuf::new(),
+            FxHashMap::from_iter([(commit_hash.clone(), commit)]),
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::from_iter([(
+                commit_hash.clone(),
+                vec![
+                    Ref::Branch {
+                        name: "dev".into(),
+                        target: commit_hash.clone(),
+                    },
+                    Ref::RemoteBranch {
+                        name: "origin/dev".into(),
+                        target: commit_hash.clone(),
+                    },
+                ],
+            )]),
+            Head::None,
+            vec![commit_hash.clone()],
+        );
+        let commit = repository.commit(&commit_hash).unwrap();
+        let graph = Graph {
+            commits: vec![commit],
+            commit_pos_map: FxHashMap::from_iter([(&commit.commit_hash, (0, 0))]),
+            edges: vec![vec![]],
+            max_pos_x: 0,
+        };
+        let graph_color_set = GraphColorSet {
+            colors: vec![GraphColor::from_rgb(0x11, 0x22, 0x33)],
+            edge_color: GraphColor::from_rgb(0, 0, 0),
+            background_color: GraphColor::from_rgb(0, 0, 0),
+        };
+
+        BranchVisuals::new(&repository, &graph, &graph_color_set)
+    }
+
+    #[test]
+    fn branch_sidebar_items_use_graph_colors() {
+        let visuals = branch_visuals();
+        let theme = ColorTheme {
+            fg: Color::White,
+            ..ColorTheme::default()
+        };
+
+        assert_eq!(
+            tree_item_color("dev", &visuals, &theme, TreeNodeKind::Branch),
+            Color::Rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(
+            tree_item_color("origin/dev", &visuals, &theme, TreeNodeKind::RemoteBranch),
+            Color::Rgb(0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn non_branch_sidebar_items_keep_theme_color() {
+        let visuals = branch_visuals();
+        let theme = ColorTheme {
+            fg: Color::White,
+            ..ColorTheme::default()
+        };
+
+        assert_eq!(
+            tree_item_color("v1.0.0", &visuals, &theme, TreeNodeKind::Other),
+            Color::White
+        );
+    }
+
+    #[test]
+    fn select_branch_name_highlights_head_branch_path() {
+        let refs = vec![
+            Ref::Branch {
+                name: "mason/audio-feedback".into(),
+                target: CommitHash::from("0123456789abcdef0123456789abcdef01234567"),
+            },
+            Ref::RemoteBranch {
+                name: "origin/mason/audio-feedback".into(),
+                target: CommitHash::from("0123456789abcdef0123456789abcdef01234567"),
+            },
+        ];
+        let mut state = RefListState::new();
+
+        state.select_branch_name(&refs, "mason/audio-feedback");
+
+        let (selected, _) = state.current_tree_status();
+        assert_eq!(
+            selected,
+            vec![
+                TREE_BRANCH_ROOT_IDENT.to_string(),
+                "mason".to_string(),
+                "mason/audio-feedback".to_string(),
+            ]
+        );
+    }
 }

@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, FixedOffset};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Result;
 
@@ -103,6 +103,14 @@ pub enum Head {
 pub enum SortCommit {
     Chronological,
     Topological,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchScope {
+    pub current_branch: Option<String>,
+    pub base_branch: String,
+    pub branch_prefix: String,
+    pub branch_origins: FxHashMap<String, String>,
 }
 
 type CommitMap = FxHashMap<CommitHash, Commit>;
@@ -214,6 +222,114 @@ impl Repository {
 
     pub fn head(&self) -> &Head {
         &self.head
+    }
+
+    pub fn filtered_for_branch_scope(&self, scope: &BranchScope) -> Self {
+        let prefix = format!("{}/", scope.branch_prefix.trim_matches('/'));
+        let mut visible_local_branches: FxHashSet<String> = FxHashSet::default();
+        visible_local_branches.insert(scope.base_branch.clone());
+        if let Some(current_branch) = &scope.current_branch {
+            visible_local_branches.insert(current_branch.clone());
+        }
+
+        for reference in self.all_refs() {
+            if let Ref::Branch { name, .. } = reference {
+                let matches_scope = scope
+                    .branch_origins
+                    .get(name)
+                    .map(|origin| origin == &scope.base_branch)
+                    .unwrap_or(false)
+                    && name.starts_with(&prefix);
+                if matches_scope {
+                    visible_local_branches.insert(name.clone());
+                }
+            }
+        }
+
+        let mut visible_ref_names: FxHashSet<String> = FxHashSet::default();
+        for branch in &visible_local_branches {
+            visible_ref_names.insert(branch.clone());
+            visible_ref_names.insert(format!("origin/{branch}"));
+        }
+        visible_ref_names.insert(format!("origin/{}", scope.base_branch));
+
+        let mut visible_commit_hashes: FxHashSet<CommitHash> = FxHashSet::default();
+        let mut stack = Vec::new();
+
+        for reference in self.all_refs() {
+            match reference {
+                Ref::Branch { name, target } | Ref::RemoteBranch { name, target }
+                    if visible_ref_names.contains(name) =>
+                {
+                    stack.push(target.clone());
+                }
+                _ => {}
+            }
+        }
+
+        while let Some(commit_hash) = stack.pop() {
+            if !visible_commit_hashes.insert(commit_hash.clone()) {
+                continue;
+            }
+            if let Some(commit) = self.commit(&commit_hash) {
+                for parent_hash in &commit.parent_commit_hashes {
+                    stack.push(parent_hash.clone());
+                }
+            }
+        }
+
+        let filtered_commits: Vec<Commit> = self
+            .commit_hashes
+            .iter()
+            .filter(|hash| visible_commit_hashes.contains(*hash))
+            .filter_map(|hash| self.commit(hash).cloned())
+            .collect();
+
+        let filtered_commit_hashes = filtered_commits
+            .iter()
+            .map(|commit| commit.commit_hash.clone())
+            .collect();
+        let (parents_map, children_map) = build_commits_maps(&filtered_commits);
+        let commit_map = to_commit_map(filtered_commits);
+
+        let mut ref_map = RefMap::default();
+        for commit_hash in &visible_commit_hashes {
+            if let Some(refs) = self.ref_map.get(commit_hash) {
+                let filtered_refs: Vec<Ref> = refs
+                    .iter()
+                    .filter(|reference| match reference {
+                        Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } => {
+                            visible_ref_names.contains(name)
+                        }
+                        Ref::Tag { .. } | Ref::Stash { .. } => true,
+                    })
+                    .cloned()
+                    .collect();
+                if !filtered_refs.is_empty() {
+                    ref_map.insert(commit_hash.clone(), filtered_refs);
+                }
+            }
+        }
+
+        let head = match &self.head {
+            Head::Branch { name } if visible_local_branches.contains(name) => {
+                Head::Branch { name: name.clone() }
+            }
+            Head::Detached { target } if visible_commit_hashes.contains(target) => Head::Detached {
+                target: target.clone(),
+            },
+            _ => Head::None,
+        };
+
+        Self::new(
+            self.path.clone(),
+            commit_map,
+            parents_map,
+            children_map,
+            ref_map,
+            head,
+            filtered_commit_hashes,
+        )
     }
 
     pub fn commit_detail(&self, commit_hash: &CommitHash) -> (Commit, Vec<FileChange>) {
@@ -587,29 +703,220 @@ fn parse_tag_refs(hash: &str, refs: &str) -> Option<Ref> {
     }
 }
 
-fn get_current_branch(path: &Path) -> Option<String> {
-    let mut cmd = Command::new("git")
-        .arg("branch")
-        .arg("--show-current")
+pub fn get_current_branch(path: &Path) -> Option<String> {
+    git_stdout(
+        Command::new("git")
+            .arg("branch")
+            .arg("--show-current")
+            .current_dir(path),
+    )
+}
+
+pub fn is_dirty(path: &Path) -> bool {
+    !git_stdout(
+        Command::new("git")
+            .arg("status")
+            .arg("--short")
+            .current_dir(path),
+    )
+    .unwrap_or_default()
+    .is_empty()
+}
+
+pub fn has_staged_changes(path: &Path) -> bool {
+    let status = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .arg("--exit-code")
         .current_dir(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .status()
         .unwrap();
+    !status.success()
+}
 
-    let stdout = cmd.stdout.take().expect("failed to open stdout");
+pub fn get_upstream_branch(path: &Path) -> Option<String> {
+    git_stdout(
+        Command::new("git")
+            .arg("rev-parse")
+            .arg("--abbrev-ref")
+            .arg("--symbolic-full-name")
+            .arg("@{upstream}")
+            .current_dir(path),
+    )
+}
 
-    let reader = BufReader::new(stdout);
+pub fn get_repo_root(path: &Path) -> Option<PathBuf> {
+    git_stdout(
+        Command::new("git")
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .current_dir(path),
+    )
+    .map(PathBuf::from)
+}
 
-    let branch = if let Some(line) = reader.lines().next() {
-        line.ok()
-    } else {
+pub fn get_git_dir(path: &Path) -> Option<PathBuf> {
+    git_stdout(
+        Command::new("git")
+            .arg("rev-parse")
+            .arg("--absolute-git-dir")
+            .current_dir(path),
+    )
+    .map(PathBuf::from)
+}
+
+pub fn get_local_branches(path: &Path) -> Vec<String> {
+    git_lines(
+        Command::new("git")
+            .arg("for-each-ref")
+            .arg("--format=%(refname:short)")
+            .arg("refs/heads")
+            .current_dir(path),
+    )
+}
+
+pub fn add_hidden_base_worktree(path: &Path, worktree_path: &Path, base: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg("-B")
+            .arg(base)
+            .arg(worktree_path)
+            .arg(base)
+            .current_dir(path),
+    )
+}
+
+pub fn remove_hidden_base_worktree(path: &Path, worktree_path: &Path) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(worktree_path)
+            .current_dir(path),
+    )
+}
+
+pub fn create_branch(path: &Path, branch: &str, start_point: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("branch")
+            .arg(branch)
+            .arg(start_point)
+            .current_dir(path),
+    )
+}
+
+pub fn switch_branch(path: &Path, branch: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("switch")
+            .arg(branch)
+            .current_dir(path),
+    )
+}
+
+pub fn stash_push(path: &Path, message: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("stash")
+            .arg("push")
+            .arg("-u")
+            .arg("-m")
+            .arg(message)
+            .current_dir(path),
+    )
+}
+
+pub fn refresh_hidden_base_worktree(worktree_path: &Path, base: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("fetch")
+            .arg("origin")
+            .current_dir(worktree_path),
+    )?;
+
+    run_git(
+        Command::new("git")
+            .arg("merge")
+            .arg("--ff-only")
+            .arg(format!("origin/{base}"))
+            .current_dir(worktree_path),
+    )
+}
+
+pub fn commit(path: &Path, message: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("commit")
+            .arg("-m")
+            .arg(message)
+            .current_dir(path),
+    )
+}
+
+pub fn commit_staged_changes(path: &Path, message: &str) -> Result<()> {
+    commit(path, message)
+}
+
+pub fn push(path: &Path, remote: &str, branch: &str, set_upstream: bool) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("push");
+    if set_upstream {
+        cmd.arg("--set-upstream");
+    }
+    cmd.arg(remote).arg(branch).current_dir(path);
+    run_git(&mut cmd)
+}
+
+pub fn merge_base_into_current(path: &Path, base: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("merge")
+            .arg("--no-edit")
+            .arg(base)
+            .current_dir(path),
+    )
+}
+
+fn git_stdout(cmd: &mut Command) -> Option<String> {
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
         None
-    };
+    } else {
+        Some(stdout)
+    }
+}
 
-    cmd.wait().unwrap();
+fn git_lines(cmd: &mut Command) -> Vec<String> {
+    git_stdout(cmd)
+        .map(|stdout| stdout.lines().map(|line| line.to_string()).collect())
+        .unwrap_or_default()
+}
 
-    branch
+fn run_git(cmd: &mut Command) -> Result<()> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+
+    if message.is_empty() {
+        Err("git command failed".into())
+    } else {
+        Err(message.into())
+    }
 }
 
 #[derive(Debug)]
@@ -618,6 +925,14 @@ pub enum FileChange {
     Modify { path: String },
     Delete { path: String },
     Move { from: String, to: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub path: String,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
 }
 
 pub fn get_diff_summary(path: &Path, commit_hash: &CommitHash) -> Vec<FileChange> {
@@ -691,4 +1006,209 @@ pub fn get_initial_commit_additions(path: &Path, commit_hash: &CommitHash) -> Ve
     cmd.wait().unwrap();
 
     changes
+}
+
+pub fn get_status_entries(path: &Path) -> Vec<StatusEntry> {
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--no-renames")
+        .arg("--untracked-files=all")
+        .current_dir(path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => parse_status_entries_z(&output.stdout),
+        _ => Vec::new(),
+    }
+}
+
+pub fn get_status_diff(path: &Path, entry: &StatusEntry) -> Result<String> {
+    if entry.untracked {
+        return git_diff_output(
+            Command::new("git")
+                .arg("diff")
+                .arg("--no-index")
+                .arg("--color=never")
+                .arg("--")
+                .arg("/dev/null")
+                .arg(&entry.path)
+                .current_dir(path),
+            true,
+        );
+    }
+
+    let staged = if entry.staged {
+        Some(git_diff_output(
+            Command::new("git")
+                .arg("diff")
+                .arg("--cached")
+                .arg("--color=never")
+                .arg("--")
+                .arg(&entry.path)
+                .current_dir(path),
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    let unstaged = if entry.unstaged {
+        Some(git_diff_output(
+            Command::new("git")
+                .arg("diff")
+                .arg("--color=never")
+                .arg("--")
+                .arg(&entry.path)
+                .current_dir(path),
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    match (staged, unstaged) {
+        (Some(staged), Some(unstaged)) => {
+            let mut diff = String::new();
+            diff.push_str("--- staged ---\n");
+            diff.push_str(&staged);
+            if !staged.ends_with('\n') {
+                diff.push('\n');
+            }
+            diff.push_str("--- unstaged ---\n");
+            diff.push_str(&unstaged);
+            Ok(diff)
+        }
+        (Some(staged), None) => Ok(staged),
+        (None, Some(unstaged)) => Ok(unstaged),
+        (None, None) => Ok(String::new()),
+    }
+}
+
+pub fn get_staged_diff(path: &Path) -> Result<String> {
+    git_diff_output(
+        Command::new("git")
+            .arg("diff")
+            .arg("--cached")
+            .arg("--no-color")
+            .arg("--no-ext-diff")
+            .current_dir(path),
+        false,
+    )
+}
+
+pub fn stage_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("add")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+pub fn unstage_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("restore")
+            .arg("--staged")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+pub fn discard_tracked_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("restore")
+            .arg("--source=HEAD")
+            .arg("--staged")
+            .arg("--worktree")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+pub fn discard_untracked_path(path: &Path, file_path: &str) -> Result<()> {
+    run_git(
+        Command::new("git")
+            .arg("clean")
+            .arg("-fd")
+            .arg("--")
+            .arg(file_path)
+            .current_dir(path),
+    )
+}
+
+fn parse_status_entries_z(stdout: &[u8]) -> Vec<StatusEntry> {
+    stdout
+        .split(|b| *b == 0)
+        .filter_map(parse_status_entry_z)
+        .collect()
+}
+
+fn parse_status_entry_z(record: &[u8]) -> Option<StatusEntry> {
+    if record.len() < 4 {
+        return None;
+    }
+
+    let staged_code = record[0] as char;
+    let unstaged_code = record[1] as char;
+    if record[2] != b' ' {
+        return None;
+    }
+
+    let path = String::from_utf8(record[3..].to_vec()).ok()?;
+
+    Some(StatusEntry {
+        path,
+        staged: staged_code != ' ' && staged_code != '?',
+        unstaged: unstaged_code != ' ' && unstaged_code != '?',
+        untracked: staged_code == '?' && unstaged_code == '?',
+    })
+}
+
+fn git_diff_output(cmd: &mut Command, allow_exit_code_one: bool) -> Result<String> {
+    let output = cmd.output()?;
+    if output.status.success() || (allow_exit_code_one && output.status.code() == Some(1)) {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+
+    if message.is_empty() {
+        Err("git command failed".into())
+    } else {
+        Err(message.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_status_entry_z_preserves_top_level_filename() {
+        let entry = parse_status_entry_z(b" M package-lock.json").unwrap();
+        assert_eq!(entry.path, "package-lock.json");
+        assert!(!entry.staged);
+        assert!(entry.unstaged);
+        assert!(!entry.untracked);
+    }
+
+    #[test]
+    fn parse_status_entries_z_parses_multiple_records() {
+        let stdout = b" M package-lock.json\0?? src/app.ts\0";
+        let entries = parse_status_entries_z(stdout);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "package-lock.json");
+        assert_eq!(entries[1].path, "src/app.ts");
+        assert!(entries[1].untracked);
+    }
 }

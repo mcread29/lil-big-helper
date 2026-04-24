@@ -1,6 +1,6 @@
-# Serie
+# lil-big-helper
 
-[![Crate Status](https://img.shields.io/crates/v/serie.svg)](https://crates.io/crates/serie)
+[![Crate Status](https://img.shields.io/crates/v/lil-big-helper.svg)](https://crates.io/crates/lil-big-helper)
 [![Built With Ratatui](https://img.shields.io/badge/Built_With-Ratatui-000?logo=ratatui&logoColor=fff&labelColor=000&color=fff)](https://ratatui.rs)
 
 A rich git commit graph in your terminal, like magic 📚
@@ -11,7 +11,7 @@ A rich git commit graph in your terminal, like magic 📚
 
 ## About
 
-Serie ([`/zéːriə/`](https://lusingander.github.io/serie/faq/index.html#how-do-i-pronounce-serie)) is a TUI application that uses the terminal emulators' image display protocol to render commit graphs like `git log --graph --all`.
+`lil-big-helper` is a TUI application that uses the terminal emulators' image display protocol to render commit graphs like `git log --graph --all`.
 
 ### Why?
 
@@ -45,7 +45,7 @@ For detailed usage, configuration, and advanced features, see [the full document
 If you're using Cargo:
 
 ```
-$ cargo install --locked serie
+$ cargo install --locked lil-big-helper
 ```
 
 For other download options, see [Installation](https://lusingander.github.io/serie/getting-started/installation.html).
@@ -54,19 +54,20 @@ For other download options, see [Installation](https://lusingander.github.io/ser
 
 ### Basic
 
-Run `serie` in the directory where your git repository exists.
+Run `lil-big-helper` or `lbh` in the directory where your git repository exists.
 
 ```
 $ cd <your git repository>
-$ serie
+$ lil-big-helper
+$ lbh
 ```
 
 ### Options
 
 ```
-Serie - A rich git commit graph in your terminal, like magic 📚
+lil-big-helper - A rich git commit graph in your terminal, like magic 📚
 
-Usage: serie [OPTIONS]
+Usage: lil-big-helper [OPTIONS]
 
 Options:
   -n, --max-count <NUMBER>        Maximum number of commits to render
@@ -91,9 +92,9 @@ The [default key bindings](https://lusingander.github.io/serie/keybindings/index
 
 Config files are loaded in the following order of priority:
 
-- `$SERIE_CONFIG_FILE`
-  - If `$SERIE_CONFIG_FILE` is set but the file does not exist, an error occurs.
-- `$XDG_CONFIG_HOME/serie/config.toml`
+- `$LIL_BIG_HELPER_CONFIG_FILE`
+  - If `$LIL_BIG_HELPER_CONFIG_FILE` is set but the file does not exist, an error occurs.
+- `$XDG_CONFIG_HOME/lil-big-helper/config.toml`
   - If `$XDG_CONFIG_HOME` is not set, `~/.config/` will be used instead.
 
 If the config file does not exist, the default values will be used for all items.

@@ -25,7 +25,7 @@ clipboard = "Auto"
 cursor_type = "Native"
 
 [ui.list]
-columns = ["graph", "marker", "subject", "name", "hash", "date"]
+columns = ["graph", "marker", "status", "subject", "name", "hash", "date"]
 subject_min_width = 20
 date_format = "%Y-%m-%d"
 date_width = 10
@@ -242,10 +242,11 @@ The type of a cursor to display in the input.
 The order and visibility of columns in the commit list.
 
 - type: `array of strings` (enum)
-- default: `["graph", "marker", "subject", "name", "hash", "date"]`
+- default: `["graph", "marker", "status", "subject", "name", "hash", "date"]`
 - possible values:
   - `graph`
   - `marker`
+  - `status`
   - `subject`
   - `name`
   - `hash`

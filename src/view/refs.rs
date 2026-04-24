@@ -35,9 +35,13 @@ impl<'a> RefsView<'a> {
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> RefsView<'a> {
+        let mut ref_list_state = RefListState::new();
+        if let crate::git::Head::Branch { name } = commit_list_state.head() {
+            ref_list_state.select_branch_name(&refs, name);
+        }
         RefsView {
             commit_list_state: Some(commit_list_state),
-            ref_list_state: RefListState::new(),
+            ref_list_state,
             refs,
             ctx,
             tx,
@@ -86,6 +90,9 @@ impl<'a> RefsView<'a> {
             UserEvent::ShortCopy | UserEvent::FullCopy => {
                 self.copy_ref_name();
             }
+            UserEvent::OpenStatus => {
+                self.tx.send(AppEvent::OpenStatus);
+            }
             UserEvent::HelpToggle => {
                 self.tx.send(AppEvent::OpenHelp);
             }
@@ -101,14 +108,15 @@ impl<'a> RefsView<'a> {
         let refs_width =
             (area.width.saturating_sub(graph_width)).min(self.ctx.ui_config.refs.width);
 
-        let [list_area, refs_area] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(refs_width)]).areas(area);
+        let [refs_area, list_area] =
+            Layout::horizontal([Constraint::Length(refs_width), Constraint::Min(0)]).areas(area);
 
-        let commit_list = CommitList::new(self.ctx.clone());
-        f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
-
-        let ref_list = RefList::new(&self.refs, self.ctx.clone());
+        let branch_visuals = self.as_list_state().branch_visuals();
+        let ref_list = RefList::new(&self.refs, branch_visuals, self.ctx.clone(), true);
         f.render_stateful_widget(ref_list, refs_area, &mut self.ref_list_state);
+
+        let commit_list = CommitList::new(self.ctx.clone(), false);
+        f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
     }
 }
 
@@ -150,6 +158,7 @@ impl<'a> RefsView<'a> {
         let refs_context = RefsRefreshViewContext {
             selected: tree_selected,
             opened: tree_opened,
+            focus_sidebar: true,
         };
         let context = RefreshViewContext::Refs {
             list_context,
@@ -159,7 +168,10 @@ impl<'a> RefsView<'a> {
     }
 
     pub fn reset_refs_with(&mut self, refs_context: RefsRefreshViewContext) {
-        self.ref_list_state
-            .reset_tree_status(refs_context.selected, refs_context.opened);
+        self.ref_list_state.reset_tree_status(
+            &self.refs,
+            refs_context.selected,
+            refs_context.opened,
+        );
     }
 }

@@ -5,9 +5,10 @@ use ratatui::{crossterm::event::KeyEvent, layout::Rect, Frame};
 use crate::{
     app::AppContext,
     event::{Sender, UserEventWithCount},
+    git::StatusEntry,
     git::{Commit, FileChange, Ref},
     view::{
-        detail::DetailView, help::HelpView, list::ListView, refs::RefsView,
+        detail::DetailView, help::HelpView, list::ListView, refs::RefsView, status::StatusView,
         user_command::UserCommandView,
     },
     widget::commit_list::CommitListState,
@@ -21,6 +22,7 @@ pub enum View<'a> {
     Detail(Box<DetailView<'a>>),
     UserCommand(Box<UserCommandView<'a>>),
     Refs(Box<RefsView<'a>>),
+    Status(Box<StatusView<'a>>),
     Help(Box<HelpView<'a>>),
 }
 
@@ -32,6 +34,7 @@ impl<'a> View<'a> {
             View::Detail(view) => view.handle_event(event_with_count, key_event),
             View::UserCommand(view) => view.handle_event(event_with_count, key_event),
             View::Refs(view) => view.handle_event(event_with_count, key_event),
+            View::Status(view) => view.handle_event(event_with_count, key_event),
             View::Help(view) => view.handle_event(event_with_count, key_event),
         }
     }
@@ -43,23 +46,34 @@ impl<'a> View<'a> {
             View::Detail(view) => view.render(f, area),
             View::UserCommand(view) => view.render(f, area),
             View::Refs(view) => view.render(f, area),
+            View::Status(view) => view.render(f, area),
             View::Help(view) => view.render(f, area),
+        }
+    }
+
+    pub fn captures_text_input(&self) -> bool {
+        match self {
+            View::Status(view) => view.captures_text_input(),
+            _ => false,
         }
     }
 
     pub fn of_list(
         commit_list_state: CommitListState<'a>,
+        refs: Vec<Ref>,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
-        View::List(Box::new(ListView::new(commit_list_state, ctx, tx)))
+        View::List(Box::new(ListView::new(commit_list_state, refs, ctx, tx)))
     }
 
     pub fn of_detail(
         commit_list_state: CommitListState<'a>,
         commit: Commit,
         changes: Vec<FileChange>,
-        refs: Vec<Ref>,
+        commit_refs: Vec<Ref>,
+        all_refs: Vec<Ref>,
+        refs_context: Option<RefsRefreshViewContext>,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
@@ -67,7 +81,9 @@ impl<'a> View<'a> {
             commit_list_state,
             commit,
             changes,
-            refs,
+            commit_refs,
+            all_refs,
+            refs_context,
             ctx,
             tx,
         )))
@@ -98,6 +114,20 @@ impl<'a> View<'a> {
         View::Refs(Box::new(RefsView::new(commit_list_state, refs, ctx, tx)))
     }
 
+    pub fn of_status(
+        commit_list_state: CommitListState<'a>,
+        entries: Vec<StatusEntry>,
+        ctx: Rc<AppContext>,
+        tx: Sender,
+    ) -> Self {
+        View::Status(Box::new(StatusView::new(
+            commit_list_state,
+            entries,
+            ctx,
+            tx,
+        )))
+    }
+
     pub fn of_help(before: View<'a>, ctx: Rc<AppContext>, tx: Sender) -> Self {
         View::Help(Box::new(HelpView::new(before, ctx, tx)))
     }
@@ -109,6 +139,7 @@ impl<'a> View<'a> {
             View::Detail(view) => view.refresh(),
             View::UserCommand(view) => view.refresh(),
             View::Refs(view) => view.refresh(),
+            View::Status(view) => view.refresh(),
             View::Help(_) => {}
         }
     }
@@ -121,6 +152,7 @@ pub enum RefreshViewContext {
     },
     Detail {
         list_context: ListRefreshViewContext,
+        refs_context: Option<RefsRefreshViewContext>,
     },
     UserCommand {
         list_context: ListRefreshViewContext,
@@ -130,15 +162,20 @@ pub enum RefreshViewContext {
         list_context: ListRefreshViewContext,
         refs_context: RefsRefreshViewContext,
     },
+    Status {
+        list_context: ListRefreshViewContext,
+        status_context: StatusRefreshViewContext,
+    },
 }
 
 impl RefreshViewContext {
     pub fn list_context(&self) -> &ListRefreshViewContext {
         match self {
             RefreshViewContext::List { list_context }
-            | RefreshViewContext::Detail { list_context }
+            | RefreshViewContext::Detail { list_context, .. }
             | RefreshViewContext::UserCommand { list_context, .. }
-            | RefreshViewContext::Refs { list_context, .. } => list_context,
+            | RefreshViewContext::Refs { list_context, .. }
+            | RefreshViewContext::Status { list_context, .. } => list_context,
         }
     }
 }
@@ -176,4 +213,10 @@ pub struct UserCommandRefreshViewContext {
 pub struct RefsRefreshViewContext {
     pub selected: Vec<String>,
     pub opened: Vec<Vec<String>>,
+    pub focus_sidebar: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusRefreshViewContext {
+    pub selected: usize,
 }

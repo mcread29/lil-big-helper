@@ -1,4 +1,7 @@
-use std::rc::Rc;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    rc::Rc,
+};
 
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use laurier::highlight::highlight_matched_text;
@@ -6,7 +9,7 @@ use once_cell::sync::Lazy;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{Event, KeyEvent},
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{List, ListItem, StatefulWidget, Widget},
@@ -20,11 +23,15 @@ use crate::{
     config::UserListColumnType,
     git::{Commit, CommitHash, Head, Ref},
     graph::GraphImageManager,
+    widget::branch_visual::BranchVisuals,
 };
 
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default().respect_case());
 
 const ELLIPSIS: &str = "...";
+const STATUS_COLUMN_WIDTH: u16 = 24;
+const FOCUSED_SELECTION_BG_FACTOR: f32 = 0.32;
+const UNFOCUSED_SELECTION_BG_FACTOR: f32 = 0.12;
 
 #[derive(Debug)]
 pub struct CommitInfo<'a> {
@@ -130,6 +137,45 @@ impl SearchMatchPosition {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BranchRefGroup {
+    visible_name: String,
+    fg: Color,
+    is_head: bool,
+    remote_names: Vec<String>,
+    ref_names: Vec<String>,
+}
+
+impl BranchRefGroup {
+    fn new(visible_name: String, fg: Color) -> Self {
+        Self {
+            visible_name,
+            fg,
+            is_head: false,
+            remote_names: Vec::new(),
+            ref_names: Vec::new(),
+        }
+    }
+
+    fn has_remote(&self) -> bool {
+        !self.remote_names.is_empty()
+    }
+
+    fn remote_suffix(&self) -> Option<String> {
+        if self.remote_names.len() <= 1 {
+            return None;
+        }
+
+        Some(format!("{{{}}}", self.remote_names.join(",")))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OrderedRef {
+    BranchGroup(usize),
+    Tag(String),
+}
+
 struct SearchMatcher {
     query: String,
     ignore_case: bool,
@@ -180,6 +226,7 @@ pub struct CommitListState<'a> {
     graph_image_manager: GraphImageManager<'a>,
     graph_cell_width: u16,
     head: &'a Head,
+    branch_visuals: Rc<BranchVisuals>,
 
     ref_name_to_commit_index_map: FxHashMap<&'a str, usize>,
 
@@ -202,6 +249,7 @@ impl<'a> CommitListState<'a> {
         graph_image_manager: GraphImageManager<'a>,
         graph_cell_width: u16,
         head: &'a Head,
+        branch_visuals: Rc<BranchVisuals>,
         ref_name_to_commit_index_map: FxHashMap<&'a str, usize>,
         default_ignore_case: bool,
         default_fuzzy: bool,
@@ -214,6 +262,7 @@ impl<'a> CommitListState<'a> {
             graph_image_manager,
             graph_cell_width,
             head,
+            branch_visuals,
             ref_name_to_commit_index_map,
             search_state: SearchState::Inactive,
             search_input: Input::default(),
@@ -229,6 +278,14 @@ impl<'a> CommitListState<'a> {
 
     pub fn graph_area_cell_width(&self) -> u16 {
         self.graph_cell_width + 1 // right pad
+    }
+
+    pub fn branch_visuals(&self) -> Rc<BranchVisuals> {
+        self.branch_visuals.clone()
+    }
+
+    pub fn head(&self) -> &Head {
+        self.head
     }
 
     pub fn select_next(&mut self) {
@@ -379,6 +436,10 @@ impl<'a> CommitListState<'a> {
         &self.commits[self.current_selected_index()]
             .commit
             .commit_hash
+    }
+
+    pub fn selected_commit_graph_color(&self) -> Color {
+        self.commits[self.current_selected_index()].graph_color
     }
 
     fn current_selected_index(&self) -> usize {
@@ -655,13 +716,15 @@ impl<'a> CommitListState<'a> {
 
 pub struct CommitList<'a> {
     ctx: Rc<AppContext>,
+    focused: bool,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> CommitList<'a> {
-    pub fn new(ctx: Rc<AppContext>) -> Self {
+    pub fn new(ctx: Rc<AppContext>, focused: bool) -> Self {
         Self {
             ctx,
+            focused,
             _marker: std::marker::PhantomData,
         }
     }
@@ -673,23 +736,27 @@ impl<'a> StatefulWidget for CommitList<'a> {
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         self.update_state(area, state);
 
+        let columns = visible_columns(&self.ctx.ui_config.list.columns);
         let constraints = calc_cell_widths(
             area.width,
             self.ctx.ui_config.list.subject_min_width,
             state.graph_area_cell_width(),
             self.ctx.ui_config.list.name_width,
             self.ctx.ui_config.list.date_width,
-            &self.ctx.ui_config.list.columns,
+            &columns,
         );
         let chunks = Layout::horizontal(constraints).split(area);
 
-        for (i, col) in self.ctx.ui_config.list.columns.iter().enumerate() {
+        for (i, col) in columns.iter().enumerate() {
             match col {
                 UserListColumnType::Graph => {
                     self.render_graph(buf, chunks[i], state);
                 }
                 UserListColumnType::Marker => {
                     self.render_marker(buf, chunks[i], state);
+                }
+                UserListColumnType::Status => {
+                    self.render_status(buf, chunks[i], state);
                 }
                 UserListColumnType::Subject => {
                     self.render_subject(buf, chunks[i], state);
@@ -698,10 +765,10 @@ impl<'a> StatefulWidget for CommitList<'a> {
                     self.render_name(buf, chunks[i], state);
                 }
                 UserListColumnType::Hash => {
-                    self.render_hash(buf, chunks[i], state);
+                    continue;
                 }
                 UserListColumnType::Date => {
-                    self.render_date(buf, chunks[i], state);
+                    continue;
                 }
             }
         }
@@ -770,16 +837,8 @@ impl CommitList<'_> {
         let items: Vec<ListItem> = self
             .rendering_commit_info_iter(state)
             .map(|(i, commit_info)| {
-                let mut spans = refs_spans(
-                    commit_info,
-                    state.head,
-                    &state.search_matches[state.offset + i].refs,
-                    &self.ctx.color_theme,
-                );
-                let ref_spans_width: usize = spans.iter().map(|s| s.width()).sum();
-                let max_width = max_width.saturating_sub(ref_spans_width);
                 let commit = commit_info.commit;
-                if max_width > ELLIPSIS.len() {
+                let spans = if max_width > ELLIPSIS.len() {
                     let truncate = console::measure_text_width(&commit.subject) > max_width;
                     let subject = if truncate {
                         console::truncate_str(&commit.subject, max_width, ELLIPSIS).to_string()
@@ -787,22 +846,41 @@ impl CommitList<'_> {
                         commit.subject.to_string()
                     };
 
-                    let sub_spans =
-                        if let Some(pos) = state.search_matches[state.offset + i].subject.clone() {
-                            highlighted_spans(
-                                subject.into(),
-                                pos,
-                                self.ctx.color_theme.list_subject_fg,
-                                Modifier::empty(),
-                                &self.ctx.color_theme,
-                                truncate,
-                            )
-                        } else {
-                            vec![subject.fg(self.ctx.color_theme.list_subject_fg)]
-                        };
+                    if let Some(pos) = state.search_matches[state.offset + i].subject.clone() {
+                        highlighted_spans(
+                            subject.into(),
+                            pos,
+                            commit_info.graph_color,
+                            Modifier::empty(),
+                            &self.ctx.color_theme,
+                            truncate,
+                        )
+                    } else {
+                        vec![subject.fg(commit_info.graph_color)]
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.to_commit_list_item(i, spans, state)
+            })
+            .collect();
+        Widget::render(List::new(items), area, buf);
+    }
 
-                    spans.extend(sub_spans)
-                }
+    fn render_status(&self, buf: &mut Buffer, area: Rect, state: &CommitListState) {
+        if area.is_empty() {
+            return;
+        }
+        let items: Vec<ListItem> = self
+            .rendering_commit_info_iter(state)
+            .map(|(i, commit_info)| {
+                let spans = status_spans(
+                    commit_info,
+                    state.head,
+                    &state.branch_visuals,
+                    &state.search_matches[state.offset + i].refs,
+                    &self.ctx.color_theme,
+                );
                 self.to_commit_list_item(i, spans, state)
             })
             .collect();
@@ -823,74 +901,28 @@ impl CommitList<'_> {
                 } else {
                     commit.author_name.to_string()
                 };
-                let spans =
+                let color = author_color(commit);
+                let name_width = console::measure_text_width(&name);
+                let pad_width = max_width.saturating_sub(name_width);
+                let mut spans = Vec::new();
+                if pad_width > 0 {
+                    spans.push(Span::raw(" ".repeat(pad_width)));
+                }
+                let name_spans =
                     if let Some(pos) = state.search_matches[state.offset + i].author_name.clone() {
                         highlighted_spans(
                             name.into(),
                             pos,
-                            self.ctx.color_theme.list_name_fg,
+                            color,
                             Modifier::empty(),
                             &self.ctx.color_theme,
                             truncate,
                         )
                     } else {
-                        vec![name.fg(self.ctx.color_theme.list_name_fg)]
+                        vec![name.fg(color)]
                     };
-                self.to_commit_list_item(i, spans, state)
-            })
-            .collect();
-        Widget::render(List::new(items), area, buf);
-    }
-
-    fn render_hash(&self, buf: &mut Buffer, area: Rect, state: &CommitListState) {
-        if area.is_empty() {
-            return;
-        }
-        let items: Vec<ListItem> = self
-            .rendering_commit_iter(state)
-            .map(|(i, commit)| {
-                let hash = commit.commit_hash.as_short_hash();
-                let spans =
-                    if let Some(pos) = state.search_matches[state.offset + i].commit_hash.clone() {
-                        highlighted_spans(
-                            hash.into(),
-                            pos,
-                            self.ctx.color_theme.list_hash_fg,
-                            Modifier::empty(),
-                            &self.ctx.color_theme,
-                            false,
-                        )
-                    } else {
-                        vec![hash.fg(self.ctx.color_theme.list_hash_fg)]
-                    };
-                self.to_commit_list_item(i, spans, state)
-            })
-            .collect();
-        Widget::render(List::new(items), area, buf);
-    }
-
-    fn render_date(&self, buf: &mut Buffer, area: Rect, state: &CommitListState) {
-        if area.is_empty() {
-            return;
-        }
-        let items: Vec<ListItem> = self
-            .rendering_commit_iter(state)
-            .map(|(i, commit)| {
-                let date = &commit.author_date;
-                let date_str = if self.ctx.ui_config.list.date_local {
-                    let local = date.with_timezone(&chrono::Local);
-                    local
-                        .format(&self.ctx.ui_config.list.date_format)
-                        .to_string()
-                } else {
-                    date.format(&self.ctx.ui_config.list.date_format)
-                        .to_string()
-                };
-                self.to_commit_list_item(
-                    i,
-                    vec![date_str.fg(self.ctx.color_theme.list_date_fg)],
-                    state,
-                )
+                spans.extend(name_spans);
+                self.to_commit_list_item_with_alignment(i, spans, state, Alignment::Right)
             })
             .collect();
         Widget::render(List::new(items), area, buf);
@@ -922,22 +954,70 @@ impl CommitList<'_> {
         spans: Vec<Span<'a>>,
         state: &'b CommitListState,
     ) -> ListItem<'a> {
+        self.to_commit_list_item_with_alignment(i, spans, state, Alignment::Left)
+    }
+
+    fn to_commit_list_item_with_alignment<'a, 'b>(
+        &'b self,
+        i: usize,
+        spans: Vec<Span<'a>>,
+        state: &'b CommitListState,
+        alignment: Alignment,
+    ) -> ListItem<'a> {
         let mut spans = spans;
         spans.insert(0, Span::raw(" "));
         spans.push(Span::raw(" "));
-        let mut line = Line::from(spans);
+        let mut line = Line::from(spans).alignment(alignment);
         if i == state.selected {
-            line = line
-                .bg(self.ctx.color_theme.list_selected_bg)
-                .fg(self.ctx.color_theme.list_selected_fg);
+            let bg = if self.focused {
+                dim_selection_color(
+                    self.ctx.color_theme.list_selected_bg,
+                    FOCUSED_SELECTION_BG_FACTOR,
+                )
+            } else {
+                dim_selection_color(
+                    self.ctx.color_theme.list_selected_bg,
+                    UNFOCUSED_SELECTION_BG_FACTOR,
+                )
+            };
+            line = line.bg(bg).fg(self.ctx.color_theme.list_selected_fg);
         }
         ListItem::new(line)
     }
 }
 
-fn refs_spans<'a>(
+fn dim_selection_color(color: Color, factor: f32) -> Color {
+    let (r, g, b) = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::DarkGray => (128, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::White => (255, 255, 255),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        other => return other,
+    };
+    Color::Rgb(
+        (r as f32 * factor) as u8,
+        (g as f32 * factor) as u8,
+        (b as f32 * factor) as u8,
+    )
+}
+
+fn status_spans<'a>(
     commit_info: &'a CommitInfo,
     head: &'a Head,
+    branch_visuals: &'a BranchVisuals,
     refs_matches: &'a FxHashMap<String, SearchMatchPosition>,
     color_theme: &'a ColorTheme,
 ) -> Vec<Span<'a>> {
@@ -945,79 +1025,257 @@ fn refs_spans<'a>(
 
     if refs.len() == 1 {
         if let Ref::Stash { name, .. } = refs[0] {
-            return vec![
-                Span::raw(name).fg(color_theme.list_ref_stash_fg).bold(),
-                Span::raw(" "),
-            ];
+            return vec![Span::raw(name).fg(commit_info.graph_color).bold()];
         }
     }
 
-    let ref_spans: Vec<(Vec<Span>, &String)> = refs
-        .iter()
-        .filter_map(|r| match r {
-            Ref::Branch { name, .. } => {
-                let fg = color_theme.list_ref_branch_fg;
-                Some((name, fg))
-            }
-            Ref::RemoteBranch { name, .. } => {
-                let fg = color_theme.list_ref_remote_branch_fg;
-                Some((name, fg))
-            }
-            Ref::Tag { name, .. } => {
-                let fg = color_theme.list_ref_tag_fg;
-                Some((name, fg))
-            }
-            Ref::Stash { .. } => None,
-        })
-        .map(|(name, fg)| {
-            let spans = refs_matches
-                .get(name)
-                .map(|pos| {
-                    highlighted_spans(
-                        name.into(),
-                        pos.clone(),
-                        fg,
-                        Modifier::BOLD,
-                        color_theme,
-                        false,
-                    )
-                })
-                .unwrap_or_else(|| vec![Span::raw(name).fg(fg).bold()]);
-            (spans, name)
-        })
-        .collect();
+    let (branch_groups, ordered_refs) = group_branch_refs(refs, head, branch_visuals);
 
-    let mut spans = vec![Span::raw("(").fg(color_theme.list_ref_paren_fg).bold()];
+    let mut spans = Vec::new();
 
     if let Head::Detached { target } = head {
         if commit_info.commit.commit_hash == *target {
-            spans.push(Span::raw("HEAD").fg(color_theme.list_head_fg).bold());
-            if !ref_spans.is_empty() {
-                spans.push(Span::raw(", ").fg(color_theme.list_ref_paren_fg).bold());
+            spans.extend(branch_visuals.head_marker(None, false, commit_info.graph_color));
+            if !ordered_refs.is_empty() {
+                spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
             }
         }
     }
 
-    for (i, ss) in ref_spans.into_iter().enumerate() {
-        let (ref_spans, ref_name) = ss;
-        if let Head::Branch { name } = head {
-            if ref_name == name {
-                spans.push(Span::raw("HEAD -> ").fg(color_theme.list_head_fg).bold());
+    let total_ref_spans = ordered_refs.len();
+    for (i, ordered_ref) in ordered_refs.iter().enumerate() {
+        match ordered_ref {
+            OrderedRef::BranchGroup(index) => {
+                let group = &branch_groups[*index];
+                let fg = if group.is_head {
+                    commit_info.graph_color
+                } else {
+                    group.fg
+                };
+                let pos = group.ref_names.iter().find_map(|name| {
+                    refs_matches.get(name).and_then(|match_pos| {
+                        display_match_position(name, &group.visible_name, match_pos)
+                    })
+                });
+                spans.extend(display_branch_group_spans(
+                    branch_visuals,
+                    group,
+                    pos.as_ref(),
+                    fg,
+                    color_theme,
+                ));
+            }
+            OrderedRef::Tag(name) => {
+                let fg = color_theme.list_ref_tag_fg;
+                let tag_spans = refs_matches
+                    .get(name)
+                    .and_then(|pos| display_match_position(name, name, pos))
+                    .map(|pos| {
+                        highlighted_spans(
+                            Span::raw(name.to_string()),
+                            pos,
+                            fg,
+                            Modifier::BOLD,
+                            color_theme,
+                            false,
+                        )
+                    })
+                    .unwrap_or_else(|| vec![Span::raw(name.to_string()).fg(fg).bold()]);
+                spans.extend(tag_spans);
             }
         }
-        spans.extend(ref_spans);
-        if i < refs.len() - 1 {
-            spans.push(Span::raw(", ").fg(color_theme.list_ref_paren_fg).bold());
+        if i + 1 < total_ref_spans {
+            spans.push(Span::raw(", ").fg(commit_info.graph_color).bold());
         }
-    }
-
-    spans.push(Span::raw(") ").fg(color_theme.list_ref_paren_fg).bold());
-
-    if spans.len() == 2 {
-        spans.clear(); // contains only "(" and ")", so clear it
     }
 
     spans
+}
+
+fn display_match_position(
+    full_name: &str,
+    display_label: &str,
+    pos: &SearchMatchPosition,
+) -> Option<SearchMatchPosition> {
+    let offset = full_name.len().saturating_sub(display_label.len());
+    let matched_indices = pos
+        .matched_indices
+        .iter()
+        .copied()
+        .filter(|index| *index >= offset)
+        .map(|index| index - offset)
+        .collect::<Vec<_>>();
+
+    if matched_indices.is_empty() {
+        None
+    } else {
+        Some(SearchMatchPosition::new(matched_indices))
+    }
+}
+
+#[cfg(test)]
+fn display_branch_ref_spans(
+    branch_visuals: &BranchVisuals,
+    reference: &Ref,
+    full_name: &str,
+    pos: Option<&SearchMatchPosition>,
+    fg: Color,
+    color_theme: &ColorTheme,
+) -> Vec<Span<'static>> {
+    let (show_remote_icon, visible_name) = match reference {
+        Ref::RemoteBranch { .. } => (true, branch_visuals.display_text(reference, true)),
+        Ref::Branch { .. } => (false, branch_visuals.display_text(reference, true)),
+        _ => (false, full_name.to_string()),
+    };
+
+    let mut spans = Vec::new();
+    if show_remote_icon {
+        spans.push(branch_visuals.remote_icon_marker(fg));
+        spans.push(branch_visuals.remote_spacing(fg));
+    }
+
+    let visible_spans = pos
+        .and_then(|pos| display_match_position(full_name, &visible_name, pos))
+        .map(|pos| {
+            highlighted_spans(
+                Span::raw(visible_name.to_string()),
+                pos,
+                fg,
+                Modifier::BOLD,
+                color_theme,
+                false,
+            )
+        })
+        .unwrap_or_else(|| vec![Span::raw(visible_name.to_string()).fg(fg).bold()]);
+    spans.extend(visible_spans);
+    spans
+}
+
+fn group_branch_refs(
+    refs: &[&Ref],
+    head: &Head,
+    branch_visuals: &BranchVisuals,
+) -> (Vec<BranchRefGroup>, Vec<OrderedRef>) {
+    let mut branch_groups = Vec::new();
+    let mut branch_group_indices = FxHashMap::default();
+    let mut ordered_refs = Vec::new();
+
+    for reference in refs
+        .iter()
+        .filter(|reference| !matches!(reference, Ref::Stash { .. }))
+    {
+        match reference {
+            Ref::Branch { name, .. } | Ref::RemoteBranch { name, .. } => {
+                let Some(canonical_name) = branch_visuals.canonical_branch_name(reference) else {
+                    continue;
+                };
+                let index = if let Some(index) = branch_group_indices.get(&canonical_name) {
+                    *index
+                } else {
+                    let index = branch_groups.len();
+                    branch_group_indices.insert(canonical_name, index);
+                    branch_groups.push(BranchRefGroup::new(
+                        branch_visuals.display_text(reference, true),
+                        branch_visuals.color_for_ref(reference),
+                    ));
+                    ordered_refs.push(OrderedRef::BranchGroup(index));
+                    index
+                };
+
+                let group = &mut branch_groups[index];
+                group.ref_names.push(name.clone());
+                if matches!(reference, Ref::Branch { .. }) {
+                    group.is_head |= branch_visuals.head_attached_to(head, reference);
+                    group.fg = branch_visuals.color_for_ref(reference);
+                } else if let Some((remote_name, _)) = name.split_once('/') {
+                    let remote_name = remote_name.to_string();
+                    if !group.remote_names.contains(&remote_name) {
+                        group.remote_names.push(remote_name);
+                    }
+                }
+            }
+            Ref::Tag { name, .. } => ordered_refs.push(OrderedRef::Tag(name.clone())),
+            Ref::Stash { .. } => {}
+        }
+    }
+
+    (branch_groups, ordered_refs)
+}
+
+fn display_branch_group_spans(
+    branch_visuals: &BranchVisuals,
+    group: &BranchRefGroup,
+    pos: Option<&SearchMatchPosition>,
+    fg: Color,
+    color_theme: &ColorTheme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if group.is_head {
+        spans.push(Span::raw("◎").fg(fg).bold());
+    }
+    if group.has_remote() {
+        spans.push(branch_visuals.remote_icon_marker(fg));
+    }
+    if group.is_head || group.has_remote() {
+        spans.push(Span::raw(" ").fg(fg).bold());
+    }
+
+    let visible_spans = pos
+        .cloned()
+        .map(|pos| {
+            highlighted_spans(
+                Span::raw(group.visible_name.clone()),
+                pos,
+                fg,
+                Modifier::BOLD,
+                color_theme,
+                false,
+            )
+        })
+        .unwrap_or_else(|| vec![Span::raw(group.visible_name.clone()).fg(fg).bold()]);
+    spans.extend(visible_spans);
+
+    if let Some(remote_suffix) = group.remote_suffix() {
+        spans.push(Span::raw(remote_suffix).fg(fg).bold());
+    }
+
+    spans
+}
+
+fn author_color(commit: &Commit) -> Color {
+    let mut hasher = DefaultHasher::new();
+    commit.author_name.hash(&mut hasher);
+    commit.author_email.hash(&mut hasher);
+    hashed_author_color(hasher.finish())
+}
+
+fn hashed_author_color(seed: u64) -> Color {
+    let hue = (seed % 360) as f32;
+    let saturation = 0.68;
+    let value = 0.92;
+    hsv_to_rgb(hue, saturation, value)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> Color {
+    let chroma = value * saturation;
+    let hue_prime = hue / 60.0;
+    let x = chroma * (1.0 - ((hue_prime % 2.0) - 1.0).abs());
+
+    let (r1, g1, b1) = match hue_prime as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+
+    let m = value - chroma;
+    Color::Rgb(
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
 }
 
 fn highlighted_spans(
@@ -1048,17 +1306,18 @@ fn calc_cell_widths(
     subject_min_width: u16,
     graph_width: u16,
     name_width: u16,
-    date_width: u16,
+    _date_width: u16,
     columns: &[UserListColumnType],
 ) -> Vec<Constraint> {
     let pad = 2;
     let (
         mut graph_cell_width,
         mut marker_cell_width,
+        mut status_cell_width,
         mut name_cell_width,
         mut hash_cell_width,
         mut date_cell_width,
-    ) = (0, 0, 0, 0, 0);
+    ) = (0, 0, 0, 0, 0, 0);
 
     for col in columns {
         match col {
@@ -1068,14 +1327,17 @@ fn calc_cell_widths(
             UserListColumnType::Marker => {
                 marker_cell_width = 1;
             }
+            UserListColumnType::Status => {
+                status_cell_width = STATUS_COLUMN_WIDTH;
+            }
             UserListColumnType::Name => {
                 name_cell_width = name_width + pad;
             }
             UserListColumnType::Hash => {
-                hash_cell_width = 7 + pad;
+                hash_cell_width = 0;
             }
             UserListColumnType::Date => {
-                date_cell_width = date_width + pad;
+                date_cell_width = 0;
             }
             UserListColumnType::Subject => {}
         }
@@ -1083,6 +1345,7 @@ fn calc_cell_widths(
 
     let mut total_width = graph_cell_width
         + marker_cell_width
+        + status_cell_width
         + hash_cell_width
         + name_cell_width
         + date_cell_width
@@ -1097,7 +1360,11 @@ fn calc_cell_widths(
         date_cell_width = 0;
     }
     if total_width > area_width {
+        total_width = total_width.saturating_sub(hash_cell_width);
         hash_cell_width = 0;
+    }
+    if total_width > area_width {
+        status_cell_width = 0;
     }
 
     let mut constraints = Vec::new();
@@ -1108,6 +1375,9 @@ fn calc_cell_widths(
             }
             UserListColumnType::Marker => {
                 constraints.push(Constraint::Length(marker_cell_width));
+            }
+            UserListColumnType::Status => {
+                constraints.push(Constraint::Length(status_cell_width));
             }
             UserListColumnType::Subject => {
                 constraints.push(Constraint::Min(0));
@@ -1126,9 +1396,171 @@ fn calc_cell_widths(
     constraints
 }
 
+fn visible_columns(columns: &[UserListColumnType]) -> Vec<UserListColumnType> {
+    columns
+        .iter()
+        .filter(|column| !matches!(column, UserListColumnType::Hash | UserListColumnType::Date))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_match_position_handles_shortened_remote_labels() {
+        let pos = SearchMatchPosition::new(vec![19, 20, 21]);
+        let display = display_match_position("origin/mason/audio-feedback", "feedback", &pos)
+            .expect("suffix match should be preserved");
+
+        assert_eq!(display.matched_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn remote_branch_spans_render_single_cloud_icon() {
+        let reference = Ref::RemoteBranch {
+            name: "origin/mason/audio-feedback".into(),
+            target: CommitHash::from("abc1234"),
+        };
+        let theme = ColorTheme::default();
+        let branch_visuals = BranchVisuals {
+            ref_colors: FxHashMap::default(),
+            fallback_colors: vec![Color::Blue],
+        };
+
+        let spans = display_branch_ref_spans(
+            &branch_visuals,
+            &reference,
+            "origin/mason/audio-feedback",
+            None,
+            Color::Blue,
+            &theme,
+        );
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "☁");
+        assert_eq!(spans[1].content.as_ref(), " ");
+        assert_eq!(spans[2].content.as_ref(), "audio-feedback");
+    }
+
+    #[test]
+    fn status_spans_dedupes_matching_local_and_remote_refs() {
+        let commit = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            ..Commit::default()
+        };
+        let branch = Ref::Branch {
+            name: "mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let remote = Ref::RemoteBranch {
+            name: "origin/mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let commit_info = CommitInfo::new(&commit, vec![&branch, &remote], Color::Green);
+        let branch_visuals = BranchVisuals {
+            ref_colors: FxHashMap::from_iter([
+                ("mason/audio-feedback".to_string(), Color::Green),
+                ("origin/mason/audio-feedback".to_string(), Color::Green),
+            ]),
+            fallback_colors: vec![Color::Green],
+        };
+        let head = Head::Branch {
+            name: "mason/audio-feedback".into(),
+        };
+        let refs_matches = FxHashMap::default();
+        let color_theme = ColorTheme::default();
+
+        let spans = status_spans(
+            &commit_info,
+            &head,
+            &branch_visuals,
+            &refs_matches,
+            &color_theme,
+        );
+
+        let contents = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, vec!["◎", "☁", " ", "audio-feedback"]);
+    }
+
+    #[test]
+    fn status_spans_show_remote_names_once_for_multiple_matching_remotes() {
+        let commit = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            ..Commit::default()
+        };
+        let branch = Ref::Branch {
+            name: "mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let origin_remote = Ref::RemoteBranch {
+            name: "origin/mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let backup_remote = Ref::RemoteBranch {
+            name: "backup/mason/audio-feedback".into(),
+            target: commit.commit_hash.clone(),
+        };
+        let commit_info = CommitInfo::new(
+            &commit,
+            vec![&branch, &origin_remote, &backup_remote],
+            Color::Green,
+        );
+        let branch_visuals = BranchVisuals {
+            ref_colors: FxHashMap::from_iter([
+                ("mason/audio-feedback".to_string(), Color::Green),
+                ("origin/mason/audio-feedback".to_string(), Color::Green),
+                ("backup/mason/audio-feedback".to_string(), Color::Green),
+            ]),
+            fallback_colors: vec![Color::Green],
+        };
+        let head = Head::Branch {
+            name: "mason/audio-feedback".into(),
+        };
+        let refs_matches = FxHashMap::default();
+        let color_theme = ColorTheme::default();
+
+        let spans = status_spans(
+            &commit_info,
+            &head,
+            &branch_visuals,
+            &refs_matches,
+            &color_theme,
+        );
+
+        let contents = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec!["◎", "☁", " ", "audio-feedback", "{origin,backup}"]
+        );
+    }
+
+    #[test]
+    fn visible_columns_filters_hash_and_date() {
+        let columns = vec![
+            UserListColumnType::Graph,
+            UserListColumnType::Hash,
+            UserListColumnType::Subject,
+            UserListColumnType::Date,
+            UserListColumnType::Name,
+        ];
+
+        assert_eq!(
+            visible_columns(&columns),
+            vec![
+                UserListColumnType::Graph,
+                UserListColumnType::Subject,
+                UserListColumnType::Name,
+            ]
+        );
+    }
 
     #[test]
     fn test_calc_cell_widths_all_columns() {
@@ -1140,6 +1572,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1156,12 +1589,13 @@ mod tests {
         );
 
         let expected = vec![
-            Constraint::Length(6),  // Graph
-            Constraint::Length(1),  // Marker
-            Constraint::Min(0),     // Subject
-            Constraint::Length(12), // Name (10 + 2 pad)
-            Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(17), // Date (15 + 2 pad)
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(24),
+            Constraint::Min(0),
+            Constraint::Length(12),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1176,6 +1610,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1191,15 +1626,14 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject + Hash = 6 + 1 + 20 + 9 = 36 > 30
-        // => Name, Date, and Hash are removed
         let expected = vec![
-            Constraint::Length(6), // Graph
-            Constraint::Length(1), // Marker
-            Constraint::Min(0),    // Subject
-            Constraint::Length(0), // Name removed
-            Constraint::Length(0), // Hash removed
-            Constraint::Length(0), // Date removed
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(0),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1214,6 +1648,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1229,16 +1664,14 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject + Hash = 6 + 1 + 20 + 9 = 36
-        // Graph + Marker + Subject + Date + Hash = 6 + 1 + 20 + 17 + 9 = 53 > 40
-        // => Name and Date are removed
         let expected = vec![
-            Constraint::Length(6), // Graph
-            Constraint::Length(1), // Marker
-            Constraint::Min(0),    // Subject
-            Constraint::Length(0), // Name removed
-            Constraint::Length(9), // Hash (7 + 2 pad)
-            Constraint::Length(0), // Date removed
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(0),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1253,6 +1686,7 @@ mod tests {
         let columns = vec![
             UserListColumnType::Graph,
             UserListColumnType::Marker,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Name,
             UserListColumnType::Hash,
@@ -1268,16 +1702,48 @@ mod tests {
             &columns,
         );
 
-        // Graph + Marker + Subject + Date + Hash = 6 + 1 + 20 + 17 + 9 = 53 <= 60
-        // Graph + Marker + Subject + Name + Date + Hash = 6 + 1 + 20 + 12 + 17 + 9 = 65 > 60
-        // => Name is removed
         let expected = vec![
-            Constraint::Length(6),  // Graph
-            Constraint::Length(1),  // Marker
-            Constraint::Min(0),     // Subject
-            Constraint::Length(0),  // Name removed
-            Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(17), // Date (15 + 2 pad)
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(24),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_calc_cell_width_keeps_status_when_space_allows() {
+        let area_width = 70;
+        let subject_min_width = 20;
+        let graph_width = 6;
+        let name_width = 10;
+        let date_width = 15;
+        let columns = vec![
+            UserListColumnType::Graph,
+            UserListColumnType::Marker,
+            UserListColumnType::Status,
+            UserListColumnType::Subject,
+            UserListColumnType::Hash,
+        ];
+
+        let actual = calc_cell_widths(
+            area_width,
+            subject_min_width,
+            graph_width,
+            name_width,
+            date_width,
+            &columns,
+        );
+
+        let expected = vec![
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(24),
+            Constraint::Min(0),
+            Constraint::Length(0),
         ];
         assert_eq!(actual, expected);
     }
@@ -1291,6 +1757,7 @@ mod tests {
         let date_width = 15;
         let columns = vec![
             UserListColumnType::Date,
+            UserListColumnType::Status,
             UserListColumnType::Subject,
             UserListColumnType::Hash,
             UserListColumnType::Graph,
@@ -1306,11 +1773,48 @@ mod tests {
         );
 
         let expected = vec![
-            Constraint::Length(17), // Date (15 + 2 pad)
-            Constraint::Min(0),     // Subject
-            Constraint::Length(9),  // Hash (7 + 2 pad)
-            Constraint::Length(6),  // Graph
+            Constraint::Length(0),
+            Constraint::Length(24),
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(6),
         ];
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn author_color_stays_stable_for_same_author() {
+        let first = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            author_name: "Alice".into(),
+            author_email: "alice@example.com".into(),
+            ..Commit::default()
+        };
+        let second = Commit {
+            commit_hash: CommitHash::from("def5678"),
+            author_name: "Alice".into(),
+            author_email: "alice@example.com".into(),
+            ..Commit::default()
+        };
+
+        assert_eq!(author_color(&first), author_color(&second));
+    }
+
+    #[test]
+    fn author_color_changes_for_different_authors() {
+        let first = Commit {
+            commit_hash: CommitHash::from("abc1234"),
+            author_name: "Alice".into(),
+            author_email: "alice@example.com".into(),
+            ..Commit::default()
+        };
+        let second = Commit {
+            commit_hash: CommitHash::from("def5678"),
+            author_name: "Bob".into(),
+            author_email: "bob@example.com".into(),
+            ..Commit::default()
+        };
+
+        assert_ne!(author_color(&first), author_color(&second));
     }
 }
