@@ -320,12 +320,12 @@ impl App<'_> {
                     self.close_user_command();
                 }
                 AppEvent::OpenRefs => {
-                    self.clear_image(None)?;
+                    self.clear_image(Some(terminal))?;
                     terminal.clear()?;
                     self.open_refs();
                 }
                 AppEvent::CloseRefs => {
-                    self.clear_image(None)?;
+                    self.clear_image(Some(terminal))?;
                     terminal.clear()?;
                     self.close_refs();
                 }
@@ -971,17 +971,21 @@ impl App<'_> {
     }
 
     fn open_detail(&mut self) {
-        let commit_list_state = match self.view {
-            View::List(ref mut view) => view.take_list_state(),
-            View::UserCommand(ref mut view) => view.take_list_state(),
+        let (commit_list_state, refs_context) = match self.view {
+            View::List(ref mut view) => (view.take_list_state(), Some(view.refs_context())),
+            View::UserCommand(ref mut view) => (view.take_list_state(), None),
             _ => return,
         };
-        let (commit, changes, refs) = selected_commit_details(self.repository, &commit_list_state);
+        let (commit, changes, commit_refs) =
+            selected_commit_details(self.repository, &commit_list_state);
+        let all_refs = self.repository.all_refs().into_iter().cloned().collect();
         self.view = View::of_detail(
             commit_list_state,
             commit,
             changes,
-            refs,
+            commit_refs,
+            all_refs,
+            refs_context,
             self.ctx.clone(),
             self.ec.sender(),
         );
@@ -989,9 +993,13 @@ impl App<'_> {
 
     fn close_detail(&mut self) {
         if let View::Detail(ref mut view) = self.view {
+            let refs_context = view.refs_context();
             let commit_list_state = view.take_list_state();
             let refs = self.repository.all_refs().into_iter().cloned().collect();
             self.view = View::of_list(commit_list_state, refs, self.ctx.clone(), self.ec.sender());
+            if let (Some(refs_context), View::List(ref mut view)) = (refs_context, &mut self.view) {
+                view.reset_refs_with(refs_context);
+            }
         }
     }
 
@@ -1232,8 +1240,13 @@ impl App<'_> {
         }
         match context {
             RefreshViewContext::List { .. } => {}
-            RefreshViewContext::Detail { .. } => {
+            RefreshViewContext::Detail { refs_context, .. } => {
                 self.open_detail();
+                if let (Some(refs_context), View::Detail(ref mut view)) =
+                    (refs_context, &mut self.view)
+                {
+                    view.set_refs_context(Some(refs_context));
+                }
             }
             RefreshViewContext::UserCommand {
                 user_command_context,

@@ -357,6 +357,15 @@ impl<'a> ListView<'a> {
         };
     }
 
+    pub fn refs_context(&self) -> RefsRefreshViewContext {
+        let (selected, opened) = self.ref_list_state.current_tree_status();
+        RefsRefreshViewContext {
+            selected,
+            opened,
+            focus_sidebar: self.focus_pane == FocusPane::Sidebar,
+        }
+    }
+
     fn handle_sidebar_event(&mut self, event: UserEvent, count: usize) {
         match event {
             UserEvent::Quit => self.tx.send(AppEvent::Quit),

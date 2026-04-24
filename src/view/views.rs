@@ -71,7 +71,9 @@ impl<'a> View<'a> {
         commit_list_state: CommitListState<'a>,
         commit: Commit,
         changes: Vec<FileChange>,
-        refs: Vec<Ref>,
+        commit_refs: Vec<Ref>,
+        all_refs: Vec<Ref>,
+        refs_context: Option<RefsRefreshViewContext>,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
@@ -79,7 +81,9 @@ impl<'a> View<'a> {
             commit_list_state,
             commit,
             changes,
-            refs,
+            commit_refs,
+            all_refs,
+            refs_context,
             ctx,
             tx,
         )))
@@ -148,6 +152,7 @@ pub enum RefreshViewContext {
     },
     Detail {
         list_context: ListRefreshViewContext,
+        refs_context: Option<RefsRefreshViewContext>,
     },
     UserCommand {
         list_context: ListRefreshViewContext,
@@ -167,7 +172,7 @@ impl RefreshViewContext {
     pub fn list_context(&self) -> &ListRefreshViewContext {
         match self {
             RefreshViewContext::List { list_context }
-            | RefreshViewContext::Detail { list_context }
+            | RefreshViewContext::Detail { list_context, .. }
             | RefreshViewContext::UserCommand { list_context, .. }
             | RefreshViewContext::Refs { list_context, .. }
             | RefreshViewContext::Status { list_context, .. } => list_context,

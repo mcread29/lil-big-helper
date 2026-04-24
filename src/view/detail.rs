@@ -10,10 +10,11 @@ use crate::{
     app::AppContext,
     event::{AppEvent, Sender, UserEvent, UserEventWithCount},
     git::{Commit, FileChange, Ref, Repository},
-    view::{ListRefreshViewContext, RefreshViewContext},
+    view::{ListRefreshViewContext, RefreshViewContext, RefsRefreshViewContext},
     widget::{
         commit_detail::{CommitDetail, CommitDetailState},
         commit_list::{CommitList, CommitListState},
+        ref_list::{RefList, RefListState},
     },
 };
 
@@ -24,7 +25,10 @@ pub struct DetailView<'a> {
 
     commit: Commit,
     changes: Vec<FileChange>,
-    refs: Vec<Ref>,
+    commit_refs: Vec<Ref>,
+    all_refs: Vec<Ref>,
+    ref_list_state: RefListState,
+    refs_context: Option<RefsRefreshViewContext>,
 
     ctx: Rc<AppContext>,
     tx: Sender,
@@ -35,16 +39,32 @@ impl<'a> DetailView<'a> {
         commit_list_state: CommitListState<'a>,
         commit: Commit,
         changes: Vec<FileChange>,
-        refs: Vec<Ref>,
+        commit_refs: Vec<Ref>,
+        all_refs: Vec<Ref>,
+        refs_context: Option<RefsRefreshViewContext>,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> DetailView<'a> {
+        let mut ref_list_state = RefListState::new();
+        if let Some(refs_context) = refs_context.as_ref() {
+            ref_list_state.reset_tree_status(
+                &all_refs,
+                refs_context.selected.clone(),
+                refs_context.opened.clone(),
+            );
+        } else if let crate::git::Head::Branch { name } = commit_list_state.head() {
+            ref_list_state.select_branch_name(&all_refs, name);
+        }
+
         DetailView {
             commit_list_state: Some(commit_list_state),
             commit_detail_state: CommitDetailState::default(),
             commit,
             changes,
-            refs,
+            commit_refs,
+            all_refs,
+            ref_list_state,
+            refs_context,
             ctx,
             tx,
         }
@@ -127,19 +147,34 @@ impl<'a> DetailView<'a> {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let detail_height = (area.height - 1).min(self.ctx.ui_config.detail.height);
-        let [list_area, detail_area] =
+        let [top_area, detail_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(area);
+
+        let graph_width = self.as_list_state().graph_area_cell_width() + 1;
+        let refs_width =
+            (top_area.width.saturating_sub(graph_width)).min(self.ctx.ui_config.refs.width);
+        let [refs_area, list_area] =
+            Layout::horizontal([Constraint::Length(refs_width), Constraint::Min(0)])
+                .areas(top_area);
+
+        let branch_visuals = self.as_list_state().branch_visuals();
+        let ref_list = RefList::new(
+            &self.all_refs,
+            branch_visuals.clone(),
+            self.ctx.clone(),
+            false,
+        );
+        f.render_stateful_widget(ref_list, refs_area, &mut self.ref_list_state);
 
         let commit_list = CommitList::new(self.ctx.clone(), true);
         f.render_stateful_widget(commit_list, list_area, self.as_mut_list_state());
 
-        let branch_visuals = self.as_list_state().branch_visuals();
         let head = self.as_list_state().head().clone();
         let graph_color = self.as_list_state().selected_commit_graph_color();
         let commit_detail = CommitDetail::new(
             &self.commit,
             &self.changes,
-            &self.refs,
+            &self.commit_refs,
             &head,
             graph_color,
             branch_visuals,
@@ -160,6 +195,21 @@ impl<'a> DetailView<'a> {
 
     pub fn as_list_state(&self) -> &CommitListState<'a> {
         self.commit_list_state.as_ref().unwrap()
+    }
+
+    pub fn refs_context(&self) -> Option<RefsRefreshViewContext> {
+        self.refs_context.clone()
+    }
+
+    pub fn set_refs_context(&mut self, refs_context: Option<RefsRefreshViewContext>) {
+        if let Some(refs_context) = refs_context.as_ref() {
+            self.ref_list_state.reset_tree_status(
+                &self.all_refs,
+                refs_context.selected.clone(),
+                refs_context.opened.clone(),
+            );
+        }
+        self.refs_context = refs_context;
     }
 
     pub fn select_older_commit(&mut self, repository: &Repository) {
@@ -185,7 +235,7 @@ impl<'a> DetailView<'a> {
         let refs = repository.refs(&selected).into_iter().cloned().collect();
         self.commit = commit;
         self.changes = changes;
-        self.refs = refs;
+        self.commit_refs = refs;
 
         self.commit_detail_state.select_first();
     }
@@ -207,7 +257,10 @@ impl<'a> DetailView<'a> {
     pub fn refresh(&self) {
         let list_state = self.as_list_state();
         let list_context = ListRefreshViewContext::from(list_state);
-        let context = RefreshViewContext::Detail { list_context };
+        let context = RefreshViewContext::Detail {
+            list_context,
+            refs_context: self.refs_context.clone(),
+        };
         self.tx.send(AppEvent::Refresh(context));
     }
 }

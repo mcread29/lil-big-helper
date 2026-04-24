@@ -243,7 +243,10 @@ mod tests {
             fallback_colors: vec![Color::Blue],
         };
 
-        assert_eq!(visuals.remote_icon_marker(Color::Blue).content.as_ref(), "☁");
+        assert_eq!(
+            visuals.remote_icon_marker(Color::Blue).content.as_ref(),
+            "☁"
+        );
         assert_eq!(visuals.remote_spacing(Color::Blue).content.as_ref(), " ");
     }
 

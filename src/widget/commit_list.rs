@@ -1052,16 +1052,11 @@ fn status_spans<'a>(
                 } else {
                     group.fg
                 };
-                let pos = group
-                    .ref_names
-                    .iter()
-                    .find_map(|name| {
-                        refs_matches
-                            .get(name)
-                            .and_then(|match_pos| {
-                                display_match_position(name, &group.visible_name, match_pos)
-                            })
-                    });
+                let pos = group.ref_names.iter().find_map(|name| {
+                    refs_matches.get(name).and_then(|match_pos| {
+                        display_match_position(name, &group.visible_name, match_pos)
+                    })
+                });
                 spans.extend(display_branch_group_spans(
                     branch_visuals,
                     group,
