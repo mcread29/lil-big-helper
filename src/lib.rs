@@ -13,6 +13,7 @@ mod protection;
 mod repo_state;
 mod view;
 mod widget;
+mod workflow;
 
 use std::{path::Path, rc::Rc};
 

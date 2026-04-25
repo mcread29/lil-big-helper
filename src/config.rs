@@ -142,6 +142,9 @@ pub struct GitHelperConfig {
     #[garde(length(min = 1))]
     #[default = "lbh:auto-switch"]
     pub stash_message_prefix: String,
+    #[garde(dive)]
+    #[nested]
+    pub workflow: GitWorkflowConfig,
 }
 
 fn validate_relative_path(path: &PathBuf, _: &()) -> garde::Result {
@@ -149,6 +152,29 @@ fn validate_relative_path(path: &PathBuf, _: &()) -> garde::Result {
         return Err(garde::Error::new("path must be relative"));
     }
     Ok(())
+}
+
+#[optional(derives = [Deserialize])]
+#[derive(Debug, Clone, PartialEq, Eq, SmartDefault, Validate)]
+pub struct GitWorkflowConfig {
+    #[garde(skip)]
+    #[default = true]
+    pub enabled: bool,
+    #[garde(length(min = 1), inner(length(min = 1)))]
+    #[default(vec!["codex".into(), "exec".into(), "--color".into(), "never".into()])]
+    pub codex_command: Vec<String>,
+    #[garde(skip)]
+    #[default = true]
+    pub require_git_dummy_index: bool,
+    #[garde(custom(validate_relative_path))]
+    #[default(PathBuf::from(".git-dummy/index.mdc"))]
+    pub git_dummy_index_path: PathBuf,
+    #[garde(skip)]
+    #[default = true]
+    pub auto_refresh_after_workflow_action: bool,
+    #[garde(length(min = 1))]
+    #[default = "gh pr create --fill"]
+    pub pr_create_default: String,
 }
 
 #[optional(derives = [Deserialize])]
@@ -491,6 +517,7 @@ mod tests {
                     install_protection_hook: true,
                     auto_set_upstream_on_first_push: true,
                     stash_message_prefix: "lbh:auto-switch".into(),
+                    workflow: GitWorkflowConfig::default(),
                 },
             },
             ui: UiConfig {
@@ -656,6 +683,7 @@ mod tests {
                     install_protection_hook: false,
                     auto_set_upstream_on_first_push: false,
                     stash_message_prefix: "custom-stash".into(),
+                    workflow: GitWorkflowConfig::default(),
                 },
             },
             ui: UiConfig {
@@ -745,6 +773,7 @@ mod tests {
                     install_protection_hook: true,
                     auto_set_upstream_on_first_push: true,
                     stash_message_prefix: "lbh:auto-switch".into(),
+                    workflow: GitWorkflowConfig::default(),
                 },
             },
             ui: UiConfig {

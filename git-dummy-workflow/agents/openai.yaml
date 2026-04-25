@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Dummy Workflow"
+  short_description: "Git rules, logging, and branch hygiene"
+  default_prompt: "Use $git-dummy-workflow to manage this repo branches, commits, pushes, and .git-dummy log safely."

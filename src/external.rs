@@ -122,84 +122,6 @@ pub fn exec_user_command_suspend(params: ExternalCommandParameters) -> Result<()
     Ok(())
 }
 
-pub fn generate_commit_message_with_codex(
-    repo_path: &Path,
-    staged_diff: &str,
-) -> Result<String, String> {
-    ensure_codex_authenticated()?;
-
-    if staged_diff.trim().is_empty() {
-        return Err("No staged diff available to generate a commit message".to_string());
-    }
-
-    let output_path = std::env::temp_dir().join(format!(
-        "lil-big-helper-codex-commit-{}-{}.txt",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default()
-    ));
-
-    let prompt = concat!(
-        "Generate a git commit message for the staged diff provided on stdin.\n",
-        "Return only the commit message text.\n",
-        "Use a short imperative subject line.\n",
-        "Include a blank line and a body only if the change benefits from extra context.\n",
-        "Do not use code fences, bullets, labels, or commentary."
-    );
-
-    let mut child = Command::new("codex")
-        .arg("exec")
-        .arg("--color")
-        .arg("never")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("-o")
-        .arg(&output_path)
-        .arg(prompt)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run codex: {e}"))?;
-
-    child
-        .stdin
-        .take()
-        .expect("stdin should be available")
-        .write_all(staged_diff.as_bytes())
-        .map_err(|e| format!("Failed to write staged diff to codex stdin: {e}"))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for codex: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let _ = fs::remove_file(&output_path);
-        if is_codex_auth_error(&stderr) {
-            return Err("Codex CLI is not authenticated. Run `codex login` and try again.".into());
-        }
-        return Err(if stderr.is_empty() {
-            format!("codex exited with non-zero status: {}", output.status)
-        } else {
-            format!("codex failed: {stderr}")
-        });
-    }
-
-    let message = fs::read_to_string(&output_path)
-        .map_err(|e| format!("Failed to read codex commit message output: {e}"))?;
-    let _ = fs::remove_file(&output_path);
-
-    let message = message.trim().to_string();
-    if message.is_empty() {
-        return Err("Codex returned an empty commit message".into());
-    }
-
-    Ok(message)
-}
-
 fn build_user_command(params: &ExternalCommandParameters) -> Vec<String> {
     fn to_vec(ss: &[&str]) -> Vec<String> {
         ss.iter().map(|s| s.to_string()).collect()
@@ -225,7 +147,7 @@ fn build_user_command(params: &ExternalCommandParameters) -> Vec<String> {
     command
 }
 
-fn ensure_codex_authenticated() -> Result<(), String> {
+pub(crate) fn ensure_codex_authenticated() -> Result<(), String> {
     let output = Command::new("codex")
         .arg("login")
         .arg("status")
@@ -255,6 +177,84 @@ fn is_codex_auth_error(message: &str) -> bool {
         || lower.contains("not authenticated")
         || lower.contains("login required")
         || lower.contains("unauthorized")
+}
+
+pub(crate) fn run_codex_exec_capture(
+    codex_command: &[String],
+    repo_path: &Path,
+    prompt: &str,
+) -> Result<String, String> {
+    ensure_codex_authenticated()?;
+    let output_path = codex_output_path("workflow");
+    let output = codex_exec_command(codex_command, repo_path, Some(&output_path), prompt)?
+        .output()
+        .map_err(|e| format!("Failed to run codex: {e}"))?;
+    finish_codex_output(output, &output_path)
+}
+
+pub(crate) fn run_codex_exec_status(
+    codex_command: &[String],
+    repo_path: &Path,
+    prompt: &str,
+) -> Result<(), String> {
+    ensure_codex_authenticated()?;
+    let status = codex_exec_command(codex_command, repo_path, None, prompt)?
+        .status()
+        .map_err(|e| format!("Failed to run codex: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("codex exited with non-zero status: {status}"))
+    }
+}
+
+fn codex_output_path(kind: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "lil-big-helper-codex-{kind}-{}-{}.txt",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    ))
+}
+
+fn codex_exec_command(
+    codex_command: &[String],
+    repo_path: &Path,
+    output_path: Option<&Path>,
+    prompt: &str,
+) -> Result<Command, String> {
+    if codex_command.is_empty() {
+        return Err("Codex command is not configured".into());
+    }
+    let mut cmd = Command::new(&codex_command[0]);
+    cmd.args(&codex_command[1..]).arg("-C").arg(repo_path);
+    if let Some(output_path) = output_path {
+        cmd.arg("-o").arg(output_path);
+    }
+    cmd.arg(prompt);
+    Ok(cmd)
+}
+
+fn finish_codex_output(output: std::process::Output, output_path: &Path) -> Result<String, String> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = fs::remove_file(output_path);
+        if is_codex_auth_error(&stderr) {
+            return Err("Codex CLI is not authenticated. Run `codex login` and try again.".into());
+        }
+        return Err(if stderr.is_empty() {
+            format!("codex exited with non-zero status: {}", output.status)
+        } else {
+            format!("codex failed: {stderr}")
+        });
+    }
+
+    let message =
+        fs::read_to_string(output_path).map_err(|e| format!("Failed to read codex output: {e}"))?;
+    let _ = fs::remove_file(output_path);
+    Ok(message.trim().to_string())
 }
 
 fn replace_command_arg(s: &str, params: &ExternalCommandParameters) -> String {

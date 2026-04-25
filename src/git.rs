@@ -776,6 +776,21 @@ pub fn get_local_branches(path: &Path) -> Vec<String> {
     )
 }
 
+pub fn get_remotes(path: &Path) -> Vec<String> {
+    git_lines(Command::new("git").arg("remote").current_dir(path))
+}
+
+pub fn get_default_remote(path: &Path) -> Option<String> {
+    git_stdout(
+        Command::new("git")
+            .arg("remote")
+            .arg("show")
+            .current_dir(path),
+    )
+    .and_then(|stdout| stdout.lines().next().map(str::to_string))
+    .or_else(|| get_remotes(path).into_iter().next())
+}
+
 pub fn add_hidden_base_worktree(path: &Path, worktree_path: &Path, base: &str) -> Result<()> {
     run_git(
         Command::new("git")
@@ -933,6 +948,7 @@ pub struct StatusEntry {
     pub staged: bool,
     pub unstaged: bool,
     pub untracked: bool,
+    pub deleted: bool,
 }
 
 pub fn get_diff_summary(path: &Path, commit_hash: &CommitHash) -> Vec<FileChange> {
@@ -1168,6 +1184,7 @@ fn parse_status_entry_z(record: &[u8]) -> Option<StatusEntry> {
         staged: staged_code != ' ' && staged_code != '?',
         unstaged: unstaged_code != ' ' && unstaged_code != '?',
         untracked: staged_code == '?' && unstaged_code == '?',
+        deleted: staged_code == 'D' || unstaged_code == 'D',
     })
 }
 
@@ -1191,6 +1208,7 @@ fn git_diff_output(cmd: &mut Command, allow_exit_code_one: bool) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn parse_status_entry_z_preserves_top_level_filename() {
@@ -1199,6 +1217,7 @@ mod tests {
         assert!(!entry.staged);
         assert!(entry.unstaged);
         assert!(!entry.untracked);
+        assert!(!entry.deleted);
     }
 
     #[test]
@@ -1210,5 +1229,40 @@ mod tests {
         assert_eq!(entries[0].path, "package-lock.json");
         assert_eq!(entries[1].path, "src/app.ts");
         assert!(entries[1].untracked);
+        assert!(!entries[1].deleted);
+    }
+
+    #[test]
+    fn parse_status_entry_z_detects_deleted_files() {
+        let entry = parse_status_entry_z(b"D  src/old.rs").unwrap();
+        assert!(entry.deleted);
+    }
+
+    #[test]
+    fn default_remote_falls_back_to_first_remote() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(Command::new("git").arg("init").current_dir(repo.path())).unwrap();
+        run_git(
+            Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "upstream",
+                    "git@example.com:upstream/repo.git",
+                ])
+                .current_dir(repo.path()),
+        )
+        .unwrap();
+        run_git(
+            Command::new("git")
+                .args(["remote", "add", "origin", "git@example.com:origin/repo.git"])
+                .current_dir(repo.path()),
+        )
+        .unwrap();
+
+        let remotes = get_remotes(Path::new(repo.path()));
+        assert!(remotes.contains(&"origin".to_string()));
+        assert!(remotes.contains(&"upstream".to_string()));
+        assert!(get_default_remote(Path::new(repo.path())).is_some());
     }
 }

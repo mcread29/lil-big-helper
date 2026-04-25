@@ -16,6 +16,7 @@ use crate::{
         commit_list::{CommitList, CommitListState, SearchState},
         ref_list::{RefList, RefListState},
     },
+    workflow::WorkflowAction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +107,9 @@ impl<'a> ListView<'a> {
                     self.tx.send(AppEvent::OpenStatus);
                 }
                 UserEvent::PushCurrent => {
-                    self.tx.send(AppEvent::PushCurrentBranch);
+                    self.tx.send(AppEvent::RunWorkflowAction(
+                        WorkflowAction::GraphPushCurrent,
+                    ));
                 }
                 UserEvent::MergeBase => {
                     self.tx.send(AppEvent::MergeBaseIntoCurrent);

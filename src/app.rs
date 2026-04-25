@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{path::Path, rc::Rc};
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent},
@@ -29,6 +29,9 @@ use crate::{
         branch_visual::BranchVisuals,
         commit_list::{CommitInfo, CommitListState},
     },
+    workflow::{
+        execute_workflow_action, WorkflowAction, WorkflowExecutionMode, WorkflowPromptContext,
+    },
 };
 
 #[derive(Debug, Default)]
@@ -47,6 +50,8 @@ enum PromptKind {
     ActionMenu,
     CreateBranchBase,
     CreateBranchSuffix { base_branch: String },
+    PullOtherRemoteRemote,
+    PullOtherRemoteBranch { remote: String },
     SwitchBranch,
     SetBase,
     SetBranchPrefix,
@@ -371,8 +376,8 @@ impl App<'_> {
                 AppEvent::NotifyError(msg) => {
                     self.error_notification(msg);
                 }
-                AppEvent::PushCurrentBranch => {
-                    self.push_current_branch();
+                AppEvent::RunWorkflowAction(action) => {
+                    self.run_workflow_action(action, WorkflowExecutionMode::Silent);
                 }
                 AppEvent::MergeBaseIntoCurrent => {
                     self.merge_base_into_current();
@@ -462,7 +467,7 @@ impl App<'_> {
     fn open_action_menu(&mut self) {
         self.open_prompt(
             PromptKind::ActionMenu,
-            "Action [b:create s:switch t:status a:base f:prefix p:push m:merge i:hook r:refresh]"
+            "Action [b:create s:switch t:status a:base f:prefix p:push l:pull L:pull-remote r:pr m:merge i:hook R:refresh]"
                 .into(),
             None,
             None,
@@ -491,7 +496,7 @@ impl App<'_> {
     }
 
     fn open_switch_branch_prompt(&mut self) {
-        let branches = git::get_local_branches(std::path::Path::new(".")).join(", ");
+        let branches = git::get_local_branches(Path::new(".")).join(", ");
         self.open_prompt(
             PromptKind::SwitchBranch,
             "Switch branch".into(),
@@ -502,6 +507,30 @@ impl App<'_> {
             },
             None,
         );
+    }
+
+    fn open_pull_other_remote_prompt(&mut self) {
+        let remotes = git::get_remotes(Path::new("."));
+        if remotes.is_empty() {
+            self.error_notification("No remotes available".into());
+            return;
+        }
+        let selector_index = git::get_default_remote(Path::new("."))
+            .and_then(|default| remotes.iter().position(|remote| remote == &default))
+            .unwrap_or(0);
+        let mut input = Input::default();
+        if let Some(current) = remotes.get(selector_index) {
+            input = input.with_value(current.clone());
+        }
+        self.app_status.prompt = Some(PromptState {
+            kind: PromptKind::PullOtherRemoteRemote,
+            label: "Pull remote".into(),
+            input,
+            transient: Some("Select a remote with left/right or j/k.".into()),
+            selector_options: remotes,
+            selector_index,
+        });
+        self.refresh_prompt_status_line();
     }
 
     fn open_set_base_prompt(&mut self) {
@@ -680,9 +709,36 @@ impl App<'_> {
                 );
             }
             PromptKind::CreateBranchSuffix { base_branch } => {
-                if let Err(err) = self.create_branch_from_base(&base_branch, value.as_str()) {
+                if let Err(err) = self.run_create_branch_workflow(&base_branch, value.as_str()) {
                     self.error_notification(err);
                 }
+            }
+            PromptKind::PullOtherRemoteRemote => {
+                let remote = value.trim().to_string();
+                if remote.is_empty() {
+                    self.error_notification("Remote name cannot be empty".into());
+                    return;
+                }
+                self.open_prompt(
+                    PromptKind::PullOtherRemoteBranch { remote },
+                    "Pull branch".into(),
+                    None,
+                    None,
+                );
+            }
+            PromptKind::PullOtherRemoteBranch { remote } => {
+                let branch = value.trim();
+                if branch.is_empty() {
+                    self.error_notification("Branch name cannot be empty".into());
+                    return;
+                }
+                self.run_workflow_action(
+                    WorkflowAction::GraphPullOtherRemote {
+                        remote,
+                        branch: branch.to_string(),
+                    },
+                    WorkflowExecutionMode::Silent,
+                );
             }
             PromptKind::SwitchBranch => {
                 if let Err(err) = self.switch_branch(value.as_str()) {
@@ -709,10 +765,22 @@ impl App<'_> {
             Some('t') => self.open_status(),
             Some('a') => self.open_set_base_prompt(),
             Some('f') => self.open_set_branch_prefix_prompt(),
-            Some('p') => self.push_current_branch(),
+            Some('p') => self.run_workflow_action(
+                WorkflowAction::GraphPushCurrent,
+                WorkflowExecutionMode::Silent,
+            ),
+            Some('l') => self.run_workflow_action(
+                WorkflowAction::GraphPullCurrent,
+                WorkflowExecutionMode::Silent,
+            ),
+            Some('L') => self.open_pull_other_remote_prompt(),
+            Some('r') => self.run_workflow_action(
+                WorkflowAction::GraphCreatePullRequest,
+                WorkflowExecutionMode::Suspend,
+            ),
             Some('m') => self.merge_base_into_current(),
             Some('i') => self.install_hook(),
-            Some('r') => self.view.refresh(),
+            Some('R') => self.view.refresh(),
             Some(other) => self.error_notification(format!("Unknown action '{other}'")),
             None => self.error_notification("No action selected".into()),
         }
@@ -810,7 +878,11 @@ impl App<'_> {
         Ok(worktree_path)
     }
 
-    fn create_branch_from_base(&mut self, base_branch: &str, suffix: &str) -> Result<(), String> {
+    fn run_create_branch_workflow(
+        &mut self,
+        base_branch: &str,
+        suffix: &str,
+    ) -> Result<(), String> {
         let suffix = suffix.trim().trim_matches('/');
         if suffix.is_empty() {
             return Err("Branch suffix cannot be empty".into());
@@ -819,16 +891,17 @@ impl App<'_> {
         self.ensure_base_worktree(base_branch)?;
 
         let branch_name = format!("{}/{}", self.current_branch_prefix(), suffix);
-        git::create_branch(std::path::Path::new("."), &branch_name, base_branch)
-            .map_err(|err| err.to_string())?;
-        git::switch_branch(std::path::Path::new("."), &branch_name)
-            .map_err(|err| err.to_string())?;
+        self.perform_workflow_action(
+            WorkflowAction::GraphCreateBranch {
+                base_branch: base_branch.to_string(),
+                branch_name: branch_name.clone(),
+            },
+            WorkflowExecutionMode::Silent,
+        )?;
 
-        let mut state = self.load_repo_state()?;
+        let mut state = self.load_repo_state().unwrap_or_default();
         state.set_branch_origin(&branch_name, base_branch);
         self.save_repo_state(&state)?;
-
-        self.view.refresh();
         Ok(())
     }
 
@@ -853,23 +926,6 @@ impl App<'_> {
         git::switch_branch(std::path::Path::new("."), branch).map_err(|err| err.to_string())?;
         self.view.refresh();
         Ok(())
-    }
-
-    fn push_current_branch(&mut self) {
-        let result = (|| -> Result<(), String> {
-            let branch = git::get_current_branch(std::path::Path::new("."))
-                .ok_or_else(|| "Not on a branch".to_string())?;
-            let set_upstream = git::get_upstream_branch(std::path::Path::new(".")).is_none()
-                && self.git_helper_config().auto_set_upstream_on_first_push;
-            git::push(std::path::Path::new("."), "origin", &branch, set_upstream)
-                .map_err(|err| err.to_string())?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => self.view.refresh(),
-            Err(err) => self.error_notification(err),
-        }
     }
 
     fn merge_base_into_current(&mut self) {
@@ -951,6 +1007,63 @@ impl App<'_> {
         self.success_notification(format!("Branch prefix set to '{prefix}'"));
         self.view.refresh();
         Ok(())
+    }
+
+    fn run_workflow_action(&mut self, action: WorkflowAction, mode: WorkflowExecutionMode) {
+        match self.perform_workflow_action(action, mode) {
+            Ok(()) => {}
+            Err(err) => self.error_notification(err),
+        }
+    }
+
+    fn perform_workflow_action(
+        &mut self,
+        action: WorkflowAction,
+        mode: WorkflowExecutionMode,
+    ) -> Result<(), String> {
+        let result = (|| -> Result<Option<String>, String> {
+            let repo_root = git::get_repo_root(Path::new("."))
+                .ok_or_else(|| "Failed to resolve repository root".to_string())?;
+            let current_branch = git::get_current_branch(Path::new("."));
+            let selected_paths = match &action {
+                WorkflowAction::StatusCommit { paths }
+                | WorkflowAction::StatusDiscard { paths } => paths.clone(),
+                _ => Vec::new(),
+            };
+            let base_branch = current_branch.as_deref().and_then(|branch| {
+                self.load_repo_state()
+                    .ok()
+                    .and_then(|state| state.get_branch_origin(branch).map(str::to_string))
+            });
+            let context = WorkflowPromptContext::gather(
+                &repo_root,
+                self.git_helper_config(),
+                selected_paths,
+                self.selected_commit_hash()
+                    .map(|hash| hash.as_str().to_string()),
+                base_branch,
+            )?;
+            execute_workflow_action(self.git_helper_config(), &action, &context, mode)
+        })();
+
+        match result {
+            Ok(output) => {
+                if let Some(output) = output.filter(|s| !s.is_empty()) {
+                    self.success_notification(output);
+                } else {
+                    self.success_notification("Workflow action completed".into());
+                }
+                if self
+                    .git_helper_config()
+                    .workflow
+                    .auto_refresh_after_workflow_action
+                {
+                    self.view.refresh();
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn update_state(&mut self, view_area: Rect) {

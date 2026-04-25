@@ -6,31 +6,35 @@ use std::{
 };
 
 use ratatui::{
-    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
-use ratatui_textarea::TextArea;
-use tui_input::{backend::crossterm::EventHandler, Input};
 
 use crate::{
     app::AppContext,
     event::{AppEvent, Sender, UserEvent, UserEventWithCount},
-    external::generate_commit_message_with_codex,
     git::{self, StatusEntry},
     view::{ListRefreshViewContext, RefreshViewContext, StatusRefreshViewContext},
     widget::commit_list::CommitListState,
+    workflow::WorkflowAction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusArea {
     Files,
-    Title,
-    Description,
-    Button,
+    DiscardButton,
+    CommitButton,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionState {
+    None,
+    Partial,
+    Full,
 }
 
 impl Default for FocusArea {
@@ -61,8 +65,7 @@ struct StatusUiState {
     diff_offset: usize,
     expanded_dirs: BTreeSet<String>,
     focus: FocusArea,
-    title: Input,
-    description: TextArea<'static>,
+    selected_paths: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -95,58 +98,37 @@ impl<'a> StatusView<'a> {
             tx,
         };
         view.ui.expanded_dirs = collect_directory_paths(&view.entries);
-        view.ui.focus = FocusArea::Files;
-        view.ui.title = Input::default().with_value(String::new());
-        view.ui
-            .description
-            .set_style(Style::default().fg(view.ctx.color_theme.status_input_fg));
-        view.ui.description.set_placeholder_style(
-            Style::default().fg(view.ctx.color_theme.status_input_transient_fg),
-        );
-        view.ui.description.set_cursor_style(
-            Style::default()
-                .fg(view.ctx.color_theme.ref_selected_fg)
-                .bg(view.ctx.color_theme.ref_selected_bg),
-        );
         view.rebuild_tree_rows();
         view.refresh_diff();
         view
     }
 
     pub fn handle_event(&mut self, event_with_count: UserEventWithCount, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc)
-            && matches!(self.ui.focus, FocusArea::Title | FocusArea::Description)
-        {
-            self.ui.focus = FocusArea::Files;
-            return;
-        }
         if is_forward_tab(key) || is_reverse_tab(key) {
             self.cycle_focus(is_reverse_tab(key));
             return;
         }
 
-        let event = event_with_count.event;
-        let count = event_with_count.count;
-
-        match event {
+        match event_with_count.event {
             UserEvent::Quit => self.tx.send(AppEvent::Quit),
             UserEvent::Cancel | UserEvent::Close => self.tx.send(AppEvent::CloseStatus),
             UserEvent::HelpToggle => self.tx.send(AppEvent::OpenHelp),
             UserEvent::Refresh => self.refresh(),
-            UserEvent::StatusCommit => self.commit_from_form(),
-            _ => self.handle_focus_event(event_with_count, key, count),
+            UserEvent::StatusCommit => self.commit_selected(),
+            UserEvent::StatusDiscard => self.discard_selected(),
+            _ => self.handle_focus_event(event_with_count),
         }
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let [upper_area, lower_area] =
-            Layout::vertical([Constraint::Min(8), Constraint::Length(7)]).areas(area);
+            Layout::vertical([Constraint::Min(8), Constraint::Length(3)]).areas(area);
         let [sidebar_area, diff_area] =
-            Layout::horizontal([Constraint::Length(36), Constraint::Min(0)]).areas(upper_area);
+            Layout::horizontal([Constraint::Length(40), Constraint::Min(0)]).areas(upper_area);
 
         self.render_file_tree(f, sidebar_area);
         self.render_diff(f, diff_area);
-        self.render_commit_form(f, lower_area);
+        self.render_action_bar(f, lower_area);
     }
 
     pub fn take_list_state(&mut self) -> CommitListState<'a> {
@@ -158,7 +140,7 @@ impl<'a> StatusView<'a> {
     }
 
     pub fn captures_text_input(&self) -> bool {
-        matches!(self.ui.focus, FocusArea::Title | FocusArea::Description)
+        false
     }
 
     pub fn reset_status_with(&mut self, ctx: StatusRefreshViewContext) {
@@ -187,12 +169,8 @@ impl<'a> StatusView<'a> {
         }));
     }
 
-    fn handle_focus_event(
-        &mut self,
-        event_with_count: UserEventWithCount,
-        key: KeyEvent,
-        count: usize,
-    ) {
+    fn handle_focus_event(&mut self, event_with_count: UserEventWithCount) {
+        let count = event_with_count.count;
         match self.ui.focus {
             FocusArea::Files => match event_with_count.event {
                 UserEvent::NavigateDown | UserEvent::SelectDown => {
@@ -209,50 +187,24 @@ impl<'a> StatusView<'a> {
                 UserEvent::GoToBottom => self.select_last(),
                 UserEvent::NavigateRight => self.expand_selected_dir(),
                 UserEvent::NavigateLeft => self.collapse_selected_dir(),
-                UserEvent::Confirm => self.activate_selected(),
-                UserEvent::StatusToggle => self.toggle_selected(),
-                UserEvent::StatusDiscard => self.discard_selected(),
+                UserEvent::Confirm | UserEvent::StatusToggle => self.activate_selected(),
                 _ => {}
             },
-            FocusArea::Title | FocusArea::Description => self.handle_text_input(key),
-            FocusArea::Button => {
-                if matches!(
-                    event_with_count.event,
-                    UserEvent::Confirm | UserEvent::StatusCommit
-                ) {
-                    self.commit_from_form();
+            FocusArea::DiscardButton => {
+                if matches!(event_with_count.event, UserEvent::Confirm) {
+                    self.discard_selected();
                 }
             }
-        }
-    }
-
-    fn handle_text_input(&mut self, key: KeyEvent) {
-        match self.ui.focus {
-            FocusArea::Title => {
-                if matches!(key.code, KeyCode::Enter) && key.modifiers == KeyModifiers::NONE {
-                    self.ui.focus = FocusArea::Description;
-                } else {
-                    self.ui.title.handle_event(&Event::Key(key));
+            FocusArea::CommitButton => {
+                if matches!(event_with_count.event, UserEvent::Confirm) {
+                    self.commit_selected();
                 }
             }
-            FocusArea::Description => {
-                self.ui.description.input(key);
-            }
-            _ => {}
         }
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
-        self.ui.focus = match (self.ui.focus, reverse) {
-            (FocusArea::Files, false) => FocusArea::Title,
-            (FocusArea::Title, false) => FocusArea::Description,
-            (FocusArea::Description, false) => FocusArea::Button,
-            (FocusArea::Button, false) => FocusArea::Files,
-            (FocusArea::Files, true) => FocusArea::Button,
-            (FocusArea::Title, true) => FocusArea::Files,
-            (FocusArea::Description, true) => FocusArea::Title,
-            (FocusArea::Button, true) => FocusArea::Description,
-        };
+        self.ui.focus = next_focus(self.ui.focus, reverse);
     }
 
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
@@ -273,12 +225,28 @@ impl<'a> StatusView<'a> {
             .skip(self.ui.file_offset)
             .take(visible_height)
             .map(|(index, row)| {
-                let is_selected = index == selected_row;
-                let mut line = Line::raw(row.label.clone());
-                if is_selected {
-                    line = line
-                        .fg(self.ctx.color_theme.ref_selected_fg)
-                        .bg(self.ctx.color_theme.ref_selected_bg);
+                let is_cursor = index == selected_row;
+                let selection_state =
+                    selection_state_for_row(row, &self.entries, &self.ui.selected_paths);
+                let marker = if row.entry_indexes.is_empty() {
+                    "   "
+                } else {
+                    selection_marker(selection_state)
+                };
+                let prefix = if is_cursor { "›" } else { " " };
+                let mut line = Line::raw(format!("{prefix} {marker} {}", row.label));
+                if is_cursor {
+                    let highlight_fg = if self.ui.focus == FocusArea::Files {
+                        self.ctx.color_theme.ref_selected_fg
+                    } else {
+                        self.ctx.color_theme.divider_fg
+                    };
+                    let highlight_bg = if self.ui.focus == FocusArea::Files {
+                        self.ctx.color_theme.ref_selected_bg
+                    } else {
+                        self.ctx.color_theme.bg
+                    };
+                    line = line.fg(highlight_fg).bg(highlight_bg);
                 } else if !row.entry_indexes.is_empty() {
                     line = line.fg(status_color_for_indexes(
                         &row.entry_indexes,
@@ -286,30 +254,30 @@ impl<'a> StatusView<'a> {
                         &self.ctx,
                     ));
                 }
-                if row.is_dir && !is_selected {
+                if row.is_dir {
                     line = line.add_modifier(Modifier::BOLD);
                 }
-                if is_selected && self.ui.focus == FocusArea::Files && !self.entries.is_empty() {
+                if matches!(
+                    selection_state,
+                    SelectionState::Partial | SelectionState::Full
+                )
+                {
                     line = line.add_modifier(Modifier::BOLD);
                 }
                 line
             })
             .collect::<Vec<_>>();
 
-        let title = format!(
-            "Changes [{}]{}",
-            self.entries.len(),
-            if self.ui.focus == FocusArea::Files {
-                " *"
-            } else {
-                ""
-            }
-        );
+        let title = format!("Changes [{}]", self.entries.len());
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
+                .style(Style::default().fg(if self.ui.focus == FocusArea::Files {
+                    self.ctx.color_theme.ref_selected_fg
+                } else {
+                    self.ctx.color_theme.divider_fg
+                }))
                 .padding(Padding::horizontal(1)),
         );
         f.render_widget(paragraph, area);
@@ -348,102 +316,29 @@ impl<'a> StatusView<'a> {
         f.render_widget(paragraph, area);
     }
 
-    fn render_commit_form(&mut self, f: &mut Frame, area: Rect) {
-        let [top_row_area, desc_area] =
-            Layout::vertical([Constraint::Length(3), Constraint::Length(4)]).areas(area);
-        let [title_area, button_area] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(14)]).areas(top_row_area);
-
-        let button_label = if self.ui.focus == FocusArea::Button {
-            "[ Commit ]"
-        } else {
-            "Commit"
-        };
-
-        let title_focused = self.ui.focus == FocusArea::Title;
-        let desc_focused = self.ui.focus == FocusArea::Description;
-        self.ui.description.set_placeholder_text("");
-        self.ui.description.set_cursor_style(if desc_focused {
-            Style::default()
-                .fg(self.ctx.color_theme.ref_selected_fg)
-                .bg(self.ctx.color_theme.ref_selected_bg)
-        } else {
-            Style::default()
-        });
-        self.ui.description.set_block(
-            Block::default()
-                .title(if desc_focused {
-                    "Description *"
-                } else {
-                    "Description"
-                })
-                .borders(Borders::ALL)
-                .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                .padding(Padding::horizontal(1)),
+    fn render_action_bar(&self, f: &mut Frame, area: Rect) {
+        let [discard_area, commit_area] =
+            Layout::horizontal([Constraint::Length(16), Constraint::Length(16)]).areas(area);
+        let enabled = self.has_selected_entries();
+        render_button(
+            f,
+            discard_area,
+            "Discard",
+            self.ui.focus == FocusArea::DiscardButton,
+            enabled,
+            self.ctx.color_theme.status_error_fg,
+            self.ctx.color_theme.divider_fg,
+            self.ctx.color_theme.ref_selected_fg,
         );
-        let title_empty = self.ui.title.value().is_empty();
-        let title_text = if title_empty {
-            if title_focused {
-                render_empty_input_cursor(
-                    title_area.width,
-                    Style::default()
-                        .fg(self.ctx.color_theme.ref_selected_fg)
-                        .bg(self.ctx.color_theme.ref_selected_bg),
-                )
-            } else {
-                Line::raw("Commit title").fg(self.ctx.color_theme.status_input_transient_fg)
-            }
-        } else {
-            render_input_value(
-                &self.ui.title,
-                title_area.width,
-                self.ctx.color_theme.status_input_fg,
-                title_focused.then(|| {
-                    Style::default()
-                        .fg(self.ctx.color_theme.ref_selected_fg)
-                        .bg(self.ctx.color_theme.ref_selected_bg)
-                }),
-            )
-        };
-        f.render_widget(
-            Paragraph::new(title_text).block(
-                Block::default()
-                    .title(if title_focused { "Title *" } else { "Title" })
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                    .padding(Padding::horizontal(1)),
-            ),
-            title_area,
-        );
-        f.render_widget(&self.ui.description, desc_area);
-        if !desc_focused && text_area_is_empty(&self.ui.description) {
-            f.render_widget(
-                Paragraph::new(
-                    Line::raw("Commit description")
-                        .fg(self.ctx.color_theme.status_input_transient_fg),
-                ),
-                input_content_area(desc_area),
-            );
-        }
-
-        let button_line = Line::raw(button_label);
-        f.render_widget(
-            Paragraph::new(button_line)
-                .alignment(Alignment::Center)
-                .style(if self.ui.focus == FocusArea::Button {
-                    Style::default()
-                        .fg(self.ctx.color_theme.ref_selected_fg)
-                        .bg(self.ctx.color_theme.ref_selected_bg)
-                } else {
-                    Style::default().fg(self.ctx.color_theme.status_success_fg)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .style(Style::default().fg(self.ctx.color_theme.divider_fg))
-                        .padding(Padding::horizontal(1)),
-                ),
-            button_area,
+        render_button(
+            f,
+            commit_area,
+            "Commit",
+            self.ui.focus == FocusArea::CommitButton,
+            enabled,
+            self.ctx.color_theme.status_success_fg,
+            self.ctx.color_theme.divider_fg,
+            self.ctx.color_theme.ref_selected_fg,
         );
     }
 
@@ -479,115 +374,60 @@ impl<'a> StatusView<'a> {
         };
         if row.is_dir && row.has_children {
             self.toggle_dir_expanded(row.path.clone());
-            return;
         }
         self.toggle_selected();
     }
 
-    fn toggle_selected(&self) {
+    fn toggle_selected(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
         };
-        if row.entry_indexes.is_empty() {
+        let entry_paths = row_entry_paths(row, &self.entries);
+        if entry_paths.is_empty() {
             return;
         }
-        let should_stage = row
-            .entry_indexes
-            .iter()
-            .filter_map(|&index| self.entries.get(index))
-            .any(|entry| entry.untracked || entry.unstaged);
-        let result = if should_stage {
-            git::stage_path(Path::new("."), &row.path)
-        } else {
-            git::unstage_path(Path::new("."), &row.path)
-        };
-
-        match result {
-            Ok(()) => self.refresh(),
-            Err(err) => self.tx.send(AppEvent::NotifyError(err.to_string())),
+        match selection_state_for_row(row, &self.entries, &self.ui.selected_paths) {
+            SelectionState::Full => {
+                for path in entry_paths {
+                    self.ui.selected_paths.remove(&path);
+                }
+            }
+            SelectionState::None | SelectionState::Partial => {
+                for path in entry_paths {
+                    self.ui.selected_paths.insert(path);
+                }
+            }
         }
     }
 
     fn discard_selected(&self) {
-        let Some(row) = self.selected_row() else {
+        let paths = selected_paths(&self.ui.selected_paths);
+        if paths.is_empty() {
+            self.tx
+                .send(AppEvent::NotifyError("No selected paths to discard".into()));
             return;
-        };
-        if row.entry_indexes.is_empty() {
-            return;
         }
-
-        let mut first_error = None;
-        for &index in &row.entry_indexes {
-            let Some(entry) = self.entries.get(index) else {
-                continue;
-            };
-            let result = if entry.untracked {
-                git::discard_untracked_path(Path::new("."), &entry.path)
-            } else {
-                git::discard_tracked_path(Path::new("."), &entry.path)
-            };
-            if let Err(err) = result {
-                first_error = Some(err.to_string());
-                break;
-            }
-        }
-
-        match first_error {
-            Some(err) => self.tx.send(AppEvent::NotifyError(err)),
-            None => self.refresh(),
-        }
+        self.tx
+            .send(AppEvent::RunWorkflowAction(WorkflowAction::StatusDiscard {
+                paths,
+            }));
     }
 
-    fn commit_from_form(&self) {
-        if !git::has_staged_changes(Path::new(".")) {
+    fn commit_selected(&self) {
+        let paths = selected_paths(&self.ui.selected_paths);
+        if paths.is_empty() {
             self.tx
-                .send(AppEvent::NotifyError("No staged changes to commit".into()));
+                .send(AppEvent::NotifyError("No selected paths to commit".into()));
             return;
         }
+        self.tx
+            .send(AppEvent::RunWorkflowAction(WorkflowAction::StatusCommit {
+                paths,
+            }));
+    }
 
-        let current_branch =
-            git::get_current_branch(Path::new(".")).unwrap_or_else(|| "detached".into());
-        if self
-            .ctx
-            .core_config
-            .git_helper
-            .protected_base_branches
-            .iter()
-            .any(|branch| branch == &current_branch)
-        {
-            self.tx.send(AppEvent::NotifyError(format!(
-                "Direct commits to protected branch '{current_branch}' are blocked"
-            )));
-            return;
-        }
-
-        let title = self.ui.title.value().trim();
-        let desc_text = self.ui.description.lines().join("\n");
-        let desc = desc_text.trim();
-
-        let message = if title.is_empty() || desc.is_empty() {
-            let staged_diff = match git::get_staged_diff(Path::new(".")) {
-                Ok(diff) => diff,
-                Err(err) => {
-                    self.tx.send(AppEvent::NotifyError(err.to_string()));
-                    return;
-                }
-            };
-            match generate_commit_message_with_codex(Path::new("."), &staged_diff) {
-                Ok(message) => message,
-                Err(err) => {
-                    self.tx.send(AppEvent::NotifyError(err));
-                    return;
-                }
-            }
-        } else {
-            format!("{title}\n\n{desc}")
-        };
-
-        match git::commit_staged_changes(Path::new("."), &message) {
-            Ok(()) => self.refresh(),
-            Err(err) => self.tx.send(AppEvent::NotifyError(err.to_string())),
-        }
+    fn has_selected_entries(&self) -> bool {
+        !self.ui.selected_paths.is_empty()
     }
 
     fn rebuild_tree_rows(&mut self) {
@@ -715,78 +555,86 @@ impl<'a> StatusView<'a> {
     }
 }
 
-fn render_input_value(
-    input: &Input,
-    area_width: u16,
-    color: ratatui::style::Color,
-    cursor_style: Option<Style>,
-) -> Line<'static> {
-    let inner_width = input_inner_width(area_width);
-    let scroll = input.cursor().saturating_sub(inner_width.max(1));
-    let visible = input
-        .value()
-        .chars()
-        .skip(scroll)
-        .take(inner_width.max(1))
-        .collect::<Vec<_>>();
+fn next_focus(current: FocusArea, reverse: bool) -> FocusArea {
+    match (current, reverse) {
+        (FocusArea::Files, false) => FocusArea::DiscardButton,
+        (FocusArea::DiscardButton, false) => FocusArea::CommitButton,
+        (FocusArea::CommitButton, false) => FocusArea::Files,
+        (FocusArea::Files, true) => FocusArea::CommitButton,
+        (FocusArea::DiscardButton, true) => FocusArea::Files,
+        (FocusArea::CommitButton, true) => FocusArea::DiscardButton,
+    }
+}
 
-    if let Some(cursor_style) = cursor_style {
-        let cursor = input.cursor().saturating_sub(scroll).min(inner_width);
-        let mut line = String::with_capacity(visible.len().max(1));
-        for ch in &visible {
-            line.push(*ch);
-        }
-        while line.len() < inner_width.max(1) {
-            line.push(' ');
-        }
-        let mut spans = Vec::new();
-        let before = line.chars().take(cursor).collect::<String>();
-        if !before.is_empty() {
-            spans.push(before.fg(color));
-        }
-        let cursor_char = line
-            .chars()
-            .nth(cursor)
-            .unwrap_or(' ')
-            .to_string()
-            .fg(ratatui::style::Color::Reset);
-        spans.push(cursor_char.style(cursor_style));
-        let after = line.chars().skip(cursor + 1).collect::<String>();
-        if !after.is_empty() {
-            spans.push(after.fg(color));
-        }
-        Line::from(spans)
-    } else if visible.is_empty() {
-        Line::raw(" ")
+fn render_button(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    focused: bool,
+    enabled: bool,
+    enabled_fg: ratatui::style::Color,
+    border_fg: ratatui::style::Color,
+    focus_border_fg: ratatui::style::Color,
+) {
+    let style = if enabled {
+        Style::default().fg(enabled_fg)
     } else {
-        Line::raw(visible.into_iter().collect::<String>()).fg(color)
+        Style::default().fg(border_fg)
+    };
+    f.render_widget(
+        Paragraph::new(Line::raw(label))
+            .alignment(Alignment::Center)
+            .style(style)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(if focused {
+                        focus_border_fg
+                    } else {
+                        border_fg
+                    }))
+                    .padding(Padding::horizontal(1)),
+            ),
+        area,
+    );
+}
+
+fn selection_marker(state: SelectionState) -> &'static str {
+    match state {
+        SelectionState::None => "[ ]",
+        SelectionState::Partial => "[/]",
+        SelectionState::Full => "[x]",
     }
 }
 
-fn render_empty_input_cursor(area_width: u16, cursor_style: Style) -> Line<'static> {
-    let inner_width = input_inner_width(area_width).max(1);
-    let mut spans = vec![Span::raw(" ").style(cursor_style)];
-    if inner_width > 1 {
-        spans.push(Span::raw(" ".repeat(inner_width - 1)));
+fn selection_state_for_row(
+    row: &TreeRow,
+    entries: &[StatusEntry],
+    selected_paths: &BTreeSet<String>,
+) -> SelectionState {
+    let entry_paths = row_entry_paths(row, entries);
+    if entry_paths.is_empty() {
+        return SelectionState::None;
     }
-    Line::from(spans)
-}
-
-fn input_inner_width(area_width: u16) -> usize {
-    area_width.saturating_sub(4) as usize
-}
-
-fn input_content_area(area: Rect) -> Rect {
-    Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
+    let selected_count = entry_paths
+        .iter()
+        .filter(|path| selected_paths.contains(*path))
+        .count();
+    if selected_count == 0 {
+        SelectionState::None
+    } else if selected_count == entry_paths.len() {
+        SelectionState::Full
+    } else {
+        SelectionState::Partial
     }
 }
 
-fn text_area_is_empty(text_area: &TextArea<'_>) -> bool {
-    text_area.lines().iter().all(|line| line.is_empty())
+fn row_entry_paths(row: &TreeRow, entries: &[StatusEntry]) -> Vec<String> {
+    row.entry_indexes
+        .iter()
+        .filter_map(|index| entries.get(*index))
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 fn is_forward_tab(key: KeyEvent) -> bool {
@@ -799,34 +647,35 @@ fn is_reverse_tab(key: KeyEvent) -> bool {
 }
 
 fn status_icon(entry: &StatusEntry) -> &'static str {
-    match (entry.staged, entry.unstaged, entry.untracked) {
-        (_, _, true) => "?",
-        (true, true, false) => "±",
-        (true, false, false) => "•",
-        (false, true, false) => "~",
-        _ => "·",
+    if entry.deleted {
+        "✖"
+    } else if entry.untracked {
+        "✚"
+    } else {
+        "●"
     }
 }
 
 fn status_icon_for_indexes(indexes: &[usize], entries: &[StatusEntry]) -> &'static str {
     let mut any_untracked = false;
-    let mut any_unstaged = false;
-    let mut any_staged = false;
+    let mut any_deleted = false;
+    let mut any_modified = false;
     for &index in indexes {
         let Some(entry) = entries.get(index) else {
             continue;
         };
         any_untracked |= entry.untracked;
-        any_unstaged |= entry.unstaged;
-        any_staged |= entry.staged;
+        any_deleted |= entry.deleted;
+        any_modified |= !entry.untracked && !entry.deleted;
     }
-
-    match (any_staged, any_unstaged, any_untracked) {
-        (_, _, true) => "?",
-        (true, true, false) => "±",
-        (true, false, false) => "•",
-        (false, true, false) => "~",
-        _ => "·",
+    if any_deleted {
+        "✖"
+    } else if any_untracked {
+        "✚"
+    } else if any_modified {
+        "●"
+    } else {
+        "·"
     }
 }
 
@@ -836,25 +685,21 @@ fn status_color_for_indexes(
     ctx: &AppContext,
 ) -> ratatui::style::Color {
     let mut any_untracked = false;
-    let mut any_unstaged = false;
-    let mut any_staged = false;
+    let mut any_deleted = false;
     for &index in indexes {
         let Some(entry) = entries.get(index) else {
             continue;
         };
         any_untracked |= entry.untracked;
-        any_unstaged |= entry.unstaged;
-        any_staged |= entry.staged;
+        any_deleted |= entry.deleted;
     }
 
-    if any_untracked {
-        ctx.color_theme.status_warn_fg
-    } else if any_staged && any_unstaged {
-        ctx.color_theme.list_ref_tag_fg
-    } else if any_staged {
+    if any_deleted {
+        ctx.color_theme.status_error_fg
+    } else if any_untracked {
         ctx.color_theme.status_success_fg
     } else {
-        ctx.color_theme.status_error_fg
+        ctx.color_theme.list_ref_stash_fg
     }
 }
 
@@ -979,6 +824,10 @@ fn collect_directory_paths(entries: &[StatusEntry]) -> BTreeSet<String> {
     paths
 }
 
+fn selected_paths(selected_paths: &BTreeSet<String>) -> Vec<String> {
+    selected_paths.iter().cloned().collect()
+}
+
 fn style_diff_line(line: &str, ctx: &AppContext) -> Line<'static> {
     if line.starts_with('+') && !line.starts_with("+++") {
         Line::raw(line.to_string()).fg(ctx.color_theme.status_success_fg)
@@ -988,5 +837,78 @@ fn style_diff_line(line: &str, ctx: &AppContext) -> Line<'static> {
         Line::raw(line.to_string()).fg(ctx.color_theme.detail_label_fg)
     } else {
         Line::raw(line.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        next_focus, row_entry_paths, selected_paths, selection_state_for_row, FocusArea,
+        SelectionState, TreeRow,
+    };
+    use crate::git::StatusEntry;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn focus_cycles_between_files_and_buttons() {
+        assert_eq!(
+            next_focus(FocusArea::Files, false),
+            FocusArea::DiscardButton
+        );
+        assert_eq!(
+            next_focus(FocusArea::DiscardButton, false),
+            FocusArea::CommitButton
+        );
+        assert_eq!(next_focus(FocusArea::CommitButton, false), FocusArea::Files);
+        assert_eq!(next_focus(FocusArea::Files, true), FocusArea::CommitButton);
+    }
+
+    #[test]
+    fn folder_selection_becomes_partial_when_child_is_deselected() {
+        let entries = vec![
+            StatusEntry {
+                path: "src/app.rs".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+            StatusEntry {
+                path: "src/view/status.rs".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+            StatusEntry {
+                path: "README.md".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+        ];
+        let src_row = TreeRow {
+            path: "src".into(),
+            is_dir: true,
+            is_expanded: true,
+            has_children: true,
+            label: "src/".into(),
+            entry_indexes: vec![0, 1],
+        };
+        let mut selected = BTreeSet::from_iter(row_entry_paths(&src_row, &entries));
+        assert_eq!(
+            selection_state_for_row(&src_row, &entries, &selected),
+            SelectionState::Full
+        );
+        selected.remove("src/app.rs");
+        assert_eq!(
+            selection_state_for_row(&src_row, &entries, &selected),
+            SelectionState::Partial
+        );
+        assert_eq!(
+            selected_paths(&selected),
+            vec!["src/view/status.rs".to_string()]
+        );
     }
 }

@@ -14,6 +14,7 @@ use serde::{
 };
 
 use crate::view::RefreshViewContext;
+use crate::workflow::WorkflowAction;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -46,7 +47,7 @@ pub enum AppEvent {
     NotifySuccess(String),
     NotifyWarn(String),
     NotifyError(String),
-    PushCurrentBranch,
+    RunWorkflowAction(WorkflowAction),
     MergeBaseIntoCurrent,
     InstallHook,
 }
