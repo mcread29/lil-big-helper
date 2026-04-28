@@ -188,6 +188,40 @@ impl<'a> HelpView<'a> {
     }
 }
 
+type HelpItem = (Vec<UserEvent>, String);
+
+fn help_item(events: &[UserEvent], description: impl Into<String>) -> HelpItem {
+    (events.to_vec(), description.into())
+}
+
+fn scroll_help_items(down_events: &[UserEvent], up_events: &[UserEvent]) -> Vec<HelpItem> {
+    vec![
+        help_item(down_events, "Scroll down"),
+        help_item(up_events, "Scroll up"),
+        help_item(&[UserEvent::PageDown], "Scroll page down"),
+        help_item(&[UserEvent::PageUp], "Scroll page up"),
+        help_item(&[UserEvent::HalfPageDown], "Scroll half page down"),
+        help_item(&[UserEvent::HalfPageUp], "Scroll half page up"),
+        help_item(&[UserEvent::GoToTop], "Go to top"),
+        help_item(&[UserEvent::GoToBottom], "Go to bottom"),
+    ]
+}
+
+fn commit_selection_help_items() -> Vec<HelpItem> {
+    vec![
+        help_item(&[UserEvent::SelectDown], "Select older commit"),
+        help_item(&[UserEvent::SelectUp], "Select newer commit"),
+        help_item(&[UserEvent::GoToParent], "Select parent commit"),
+    ]
+}
+
+fn commit_copy_help_items() -> Vec<HelpItem> {
+    vec![
+        help_item(&[UserEvent::ShortCopy], "Copy commit short hash"),
+        help_item(&[UserEvent::FullCopy], "Copy commit hash"),
+    ]
+}
+
 #[rustfmt::skip]
 fn build_lines(
     color_theme: &ColorTheme,
@@ -202,109 +236,91 @@ fn build_lines(
                 .user_command
                 .commands
                 .get(&n.to_string())
-                .map(|c| format!("Execute user command {} - {}", n, c.name))
-                .map(|desc| (vec![UserEvent::UserCommand(n)], desc))
+                .map(|c| format!("Show user command {} - {}", n, c.name))
+                .map(|desc| help_item(&[UserEvent::UserCommand(n)], desc))
         })
         .collect::<Vec<_>>();
 
     let common_helps = vec![
-        (vec![UserEvent::ForceQuit, UserEvent::Quit], "Quit app".into()),
-        (vec![UserEvent::HelpToggle], "Open help".into()),
+        help_item(&[UserEvent::ForceQuit, UserEvent::Quit], "Quit app"),
+        help_item(&[UserEvent::HelpToggle], "Open help"),
     ];
     let (common_key_lines, common_value_lines) = build_block_lines("Common:", common_helps, color_theme, keybind);
 
-    let help_helps = vec![
-        (vec![UserEvent::HelpToggle, UserEvent::Cancel, UserEvent::Close], "Close help".into()),
-        (vec![UserEvent::NavigateDown, UserEvent::SelectDown], "Scroll down".into()),
-        (vec![UserEvent::NavigateUp, UserEvent::SelectUp], "Scroll up".into()),
-        (vec![UserEvent::PageDown], "Scroll page down".into()),
-        (vec![UserEvent::PageUp], "Scroll page up".into()),
-        (vec![UserEvent::HalfPageDown], "Scroll half page down".into()),
-        (vec![UserEvent::HalfPageUp], "Scroll half page up".into()),
-        (vec![UserEvent::GoToTop], "Go to top".into()),
-        (vec![UserEvent::GoToBottom], "Go to bottom".into()),
-    ];
+    let mut help_helps = vec![help_item(
+        &[UserEvent::HelpToggle, UserEvent::Cancel, UserEvent::Close],
+        "Close help",
+    )];
+    help_helps.extend(scroll_help_items(
+        &[UserEvent::NavigateDown, UserEvent::SelectDown],
+        &[UserEvent::NavigateUp, UserEvent::SelectUp],
+    ));
     let (help_key_lines, help_value_lines) = build_block_lines("Help:", help_helps, color_theme, keybind);
 
     let mut list_helps = vec![
-        (vec![UserEvent::NavigateDown, UserEvent::SelectDown], "Move down".into()),
-        (vec![UserEvent::NavigateUp, UserEvent::SelectUp], "Move up".into()),
-        (vec![UserEvent::GoToParent], "Go to parent".into()),
-        (vec![UserEvent::GoToTop], "Go to top".into()),
-        (vec![UserEvent::GoToBottom], "Go to bottom".into()),
-        (vec![UserEvent::PageDown], "Scroll page down".into()),
-        (vec![UserEvent::PageUp], "Scroll page up".into()),
-        (vec![UserEvent::HalfPageDown], "Scroll half page down".into()),
-        (vec![UserEvent::HalfPageUp], "Scroll half page up".into()),
-        (vec![UserEvent::ScrollDown], "Scroll down".into()),
-        (vec![UserEvent::ScrollUp], "Scroll up".into()),
-        (vec![UserEvent::SelectTop], "Select top of the screen".into()),
-        (vec![UserEvent::SelectMiddle], "Select middle of the screen".into()),
-        (vec![UserEvent::SelectBottom], "Select bottom of the screen".into()),
-        (vec![UserEvent::Confirm], "Show commit details".into()),
-        (vec![UserEvent::RefList], "Toggle sidebar focus".into()),
-        (vec![UserEvent::Search], "Start search".into()),
-        (vec![UserEvent::Cancel], "Cancel search".into()),
-        (vec![UserEvent::GoToNext], "Go to next search match".into()),
-        (vec![UserEvent::GoToPrevious], "Go to previous search match".into()),
-        (vec![UserEvent::IgnoreCaseToggle], "Toggle ignore case".into()),
-        (vec![UserEvent::FuzzyToggle], "Toggle fuzzy match".into()),
-        (vec![UserEvent::Refresh], "Refresh".into()),
-        (vec![UserEvent::ShortCopy], "Copy commit short hash".into()),
-        (vec![UserEvent::FullCopy], "Copy commit hash".into()),
+        help_item(&[UserEvent::NavigateDown, UserEvent::SelectDown], "Move down"),
+        help_item(&[UserEvent::NavigateUp, UserEvent::SelectUp], "Move up"),
+        help_item(&[UserEvent::GoToParent], "Go to parent"),
+        help_item(&[UserEvent::GoToTop], "Go to top"),
+        help_item(&[UserEvent::GoToBottom], "Go to bottom"),
+        help_item(&[UserEvent::PageDown], "Scroll page down"),
+        help_item(&[UserEvent::PageUp], "Scroll page up"),
+        help_item(&[UserEvent::HalfPageDown], "Scroll half page down"),
+        help_item(&[UserEvent::HalfPageUp], "Scroll half page up"),
+        help_item(&[UserEvent::ScrollDown], "Scroll down"),
+        help_item(&[UserEvent::ScrollUp], "Scroll up"),
+        help_item(&[UserEvent::SelectTop], "Select top of the screen"),
+        help_item(&[UserEvent::SelectMiddle], "Select middle of the screen"),
+        help_item(&[UserEvent::SelectBottom], "Select bottom of the screen"),
+        help_item(&[UserEvent::Confirm], "Show commit details"),
+        help_item(&[UserEvent::RefList], "Toggle sidebar focus"),
+        help_item(&[UserEvent::Search], "Start search"),
+        help_item(&[UserEvent::Cancel], "Cancel search"),
+        help_item(&[UserEvent::GoToNext], "Go to next search match"),
+        help_item(&[UserEvent::GoToPrevious], "Go to previous search match"),
+        help_item(&[UserEvent::IgnoreCaseToggle], "Toggle ignore case"),
+        help_item(&[UserEvent::FuzzyToggle], "Toggle fuzzy match"),
+        help_item(&[UserEvent::Refresh], "Refresh"),
     ];
+    list_helps.extend(commit_copy_help_items());
     list_helps.extend(user_command_help_items.clone());
     let (list_key_lines, list_value_lines) = build_block_lines("Commit List:", list_helps, color_theme, keybind);
     
-    let mut detail_helps = vec![
-        (vec![UserEvent::Cancel, UserEvent::Close, UserEvent::Confirm], "Close commit details".into()),
-        (vec![UserEvent::NavigateDown], "Scroll down".into()),
-        (vec![UserEvent::NavigateUp], "Scroll up".into()),
-        (vec![UserEvent::PageDown], "Scroll page down".into()),
-        (vec![UserEvent::PageUp], "Scroll page up".into()),
-        (vec![UserEvent::HalfPageDown], "Scroll half page down".into()),
-        (vec![UserEvent::HalfPageUp], "Scroll half page up".into()),
-        (vec![UserEvent::GoToTop], "Go to top".into()),
-        (vec![UserEvent::GoToBottom], "Go to bottom".into()),
-        (vec![UserEvent::SelectDown], "Select older commit".into()),
-        (vec![UserEvent::SelectUp], "Select newer commit".into()),
-        (vec![UserEvent::GoToParent], "Select parent commit".into()),
-        (vec![UserEvent::Refresh], "Refresh".into()),
-        (vec![UserEvent::ShortCopy], "Copy commit short hash".into()),
-        (vec![UserEvent::FullCopy], "Copy commit hash".into()),
-    ];
+    let mut detail_helps = vec![help_item(
+        &[UserEvent::Cancel, UserEvent::Close, UserEvent::Confirm],
+        "Close commit details",
+    )];
+    detail_helps.extend(scroll_help_items(&[UserEvent::NavigateDown], &[UserEvent::NavigateUp]));
+    detail_helps.extend(commit_selection_help_items());
+    detail_helps.push(help_item(&[UserEvent::Refresh], "Refresh"));
+    detail_helps.extend(commit_copy_help_items());
     detail_helps.extend(user_command_help_items.clone());
     let (detail_key_lines, detail_value_lines) = build_block_lines("Commit Detail:", detail_helps, color_theme, keybind);
 
     let refs_helps = vec![
-        (vec![UserEvent::Cancel, UserEvent::Close, UserEvent::RefList], "Focus commit list".into()),
-        (vec![UserEvent::NavigateDown, UserEvent::SelectDown], "Move down".into()),
-        (vec![UserEvent::NavigateUp, UserEvent::SelectUp], "Move up".into()),
-        (vec![UserEvent::GoToTop], "Go to top".into()),
-        (vec![UserEvent::GoToBottom], "Go to bottom".into()),
-        (vec![UserEvent::NavigateRight], "Open node".into()),
-        (vec![UserEvent::NavigateLeft], "Close node".into()),
-        (vec![UserEvent::Refresh], "Refresh".into()),
-        (vec![UserEvent::ShortCopy], "Copy ref name".into()),
+        help_item(&[UserEvent::Cancel, UserEvent::Close, UserEvent::RefList], "Focus commit list"),
+        help_item(&[UserEvent::NavigateDown, UserEvent::SelectDown], "Move down"),
+        help_item(&[UserEvent::NavigateUp, UserEvent::SelectUp], "Move up"),
+        help_item(&[UserEvent::GoToTop], "Go to top"),
+        help_item(&[UserEvent::GoToBottom], "Go to bottom"),
+        help_item(&[UserEvent::NavigateRight], "Open node"),
+        help_item(&[UserEvent::NavigateLeft], "Close node"),
+        help_item(&[UserEvent::Refresh], "Refresh"),
+        help_item(&[UserEvent::ShortCopy, UserEvent::FullCopy], "Copy ref name"),
     ];
     let (refs_key_lines, refs_value_lines) = build_block_lines("Refs List:", refs_helps, color_theme, keybind);
     
-    let mut user_command_helps = vec![
-        (vec![UserEvent::Cancel, UserEvent::Close], "Close user command".into()),
-        (vec![UserEvent::NavigateDown], "Scroll down".into()),
-        (vec![UserEvent::NavigateUp], "Scroll up".into()),
-        (vec![UserEvent::PageDown], "Scroll page down".into()),
-        (vec![UserEvent::PageUp], "Scroll page up".into()),
-        (vec![UserEvent::HalfPageDown], "Scroll half page down".into()),
-        (vec![UserEvent::HalfPageUp], "Scroll half page up".into()),
-        (vec![UserEvent::GoToTop], "Go to top".into()),
-        (vec![UserEvent::GoToBottom], "Go to bottom".into()),
-        (vec![UserEvent::SelectDown], "Select older commit".into()),
-        (vec![UserEvent::SelectUp], "Select newer commit".into()),
-        (vec![UserEvent::GoToParent], "Select parent commit".into()),
-        (vec![UserEvent::Refresh], "Refresh".into()),
-        (vec![UserEvent::Confirm], "Show commit details".into()),
-    ];
+    let mut user_command_helps = vec![help_item(
+        &[UserEvent::Cancel, UserEvent::Close],
+        "Close user command",
+    )];
+    user_command_helps.extend(scroll_help_items(
+        &[UserEvent::NavigateDown],
+        &[UserEvent::NavigateUp],
+    ));
+    user_command_helps.extend(commit_selection_help_items());
+    user_command_helps.push(help_item(&[UserEvent::Refresh], "Refresh"));
+    user_command_helps.push(help_item(&[UserEvent::Confirm], "Show commit details"));
     user_command_helps.extend(user_command_help_items);
     let (user_command_key_lines, user_command_value_lines) = build_block_lines("User Command:", user_command_helps, color_theme, keybind);
 
@@ -389,4 +405,108 @@ fn join_span_groups_with_space(span_groups: Vec<Vec<Span<'static>>>) -> Line<'st
         }
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn line_to_string(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn expected_key_text(keybind: &KeyBind, events: &[UserEvent]) -> String {
+        events
+            .iter()
+            .flat_map(|event| keybind.keys_for_event(*event))
+            .map(|key| format!("<{key}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn help_sections(keybind: &KeyBind) -> BTreeMap<String, Vec<(String, String)>> {
+        let (key_lines, value_lines) =
+            build_lines(&ColorTheme::default(), keybind, &CoreConfig::default());
+        let mut sections = BTreeMap::<String, Vec<(String, String)>>::new();
+        let mut current_section = None::<String>;
+
+        for (key_line, value_line) in key_lines.iter().zip(value_lines.iter()) {
+            let key = line_to_string(key_line);
+            let value = line_to_string(value_line);
+
+            if key.is_empty() && value.is_empty() {
+                continue;
+            }
+
+            if value.is_empty() && key.ends_with(':') {
+                current_section = Some(key.clone());
+                sections.entry(key).or_default();
+                continue;
+            }
+
+            sections
+                .get_mut(
+                    current_section
+                        .as_ref()
+                        .expect("help entry should follow a section"),
+                )
+                .expect("section should exist")
+                .push((value, key));
+        }
+
+        sections
+    }
+
+    #[test]
+    fn refs_copy_help_uses_all_copy_keybinds() {
+        let keybind = KeyBind::new(None);
+        let sections = help_sections(&keybind);
+        let refs_entries = &sections["Refs List:"];
+        let copy_ref_name = refs_entries
+            .iter()
+            .find(|(label, _)| label == "Copy ref name")
+            .expect("refs copy entry should exist");
+
+        assert_eq!(
+            copy_ref_name.1,
+            expected_key_text(&keybind, &[UserEvent::ShortCopy, UserEvent::FullCopy]),
+        );
+    }
+
+    #[test]
+    fn detail_and_user_command_commit_navigation_help_matches_keybinds() {
+        let keybind = KeyBind::new(None);
+        let sections = help_sections(&keybind);
+
+        for section_name in ["Commit Detail:", "User Command:"] {
+            let entries = &sections[section_name];
+            let older = entries
+                .iter()
+                .find(|(label, _)| label == "Select older commit")
+                .expect("older commit entry should exist");
+            let newer = entries
+                .iter()
+                .find(|(label, _)| label == "Select newer commit")
+                .expect("newer commit entry should exist");
+            let parent = entries
+                .iter()
+                .find(|(label, _)| label == "Select parent commit")
+                .expect("parent commit entry should exist");
+
+            assert_eq!(
+                older.1,
+                expected_key_text(&keybind, &[UserEvent::SelectDown])
+            );
+            assert_eq!(newer.1, expected_key_text(&keybind, &[UserEvent::SelectUp]));
+            assert_eq!(
+                parent.1,
+                expected_key_text(&keybind, &[UserEvent::GoToParent])
+            );
+        }
+    }
 }

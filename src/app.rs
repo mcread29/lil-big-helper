@@ -1,4 +1,4 @@
-use std::{path::Path, rc::Rc};
+use std::{path::Path, rc::Rc, thread};
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent},
@@ -39,6 +39,7 @@ enum StatusLine {
     #[default]
     None,
     Input(String, Option<u16>, Option<String>),
+    Busy(String),
     NotificationInfo(String),
     NotificationSuccess(String),
     NotificationWarn(String),
@@ -97,6 +98,22 @@ struct AppStatus {
     numeric_prefix: String,
     view_area: Rect,
     prompt: Option<PromptState>,
+    busy_frame: usize,
+}
+
+#[derive(Debug)]
+enum WorkflowPostAction {
+    SaveBranchOrigin {
+        branch_name: String,
+        base_branch: String,
+    },
+}
+
+#[derive(Debug)]
+struct RunningWorkflow {
+    should_refresh: bool,
+    resume_terminal: bool,
+    post_action: Option<WorkflowPostAction>,
 }
 
 #[derive(Debug)]
@@ -104,6 +121,7 @@ pub struct App<'a> {
     repository: &'a Repository,
     view: View<'a>,
     app_status: AppStatus,
+    running_workflow: Option<RunningWorkflow>,
     ctx: Rc<AppContext>,
     ec: &'a EventController,
 }
@@ -164,6 +182,7 @@ impl<'a> App<'a> {
             repository,
             view,
             app_status: AppStatus::default(),
+            running_workflow: None,
             ctx,
             ec,
         };
@@ -185,13 +204,16 @@ impl App<'_> {
         loop {
             terminal.draw(|f| self.render(f))?;
             match self.ec.recv() {
+                AppEvent::Tick => {
+                    self.advance_busy_frame();
+                }
                 AppEvent::Key(key) => {
                     if self.app_status.prompt.is_some() {
                         self.handle_prompt_key(key);
                         continue;
                     }
                     match self.app_status.status_line {
-                        StatusLine::None | StatusLine::Input(_, _, _) => {
+                        StatusLine::None | StatusLine::Input(_, _, _) | StatusLine::Busy(_) => {
                             // do nothing
                         }
                         StatusLine::NotificationInfo(_)
@@ -376,8 +398,17 @@ impl App<'_> {
                 AppEvent::NotifyError(msg) => {
                     self.error_notification(msg);
                 }
-                AppEvent::RunWorkflowAction(action) => {
-                    self.run_workflow_action(action, WorkflowExecutionMode::Silent);
+                AppEvent::RunWorkflowAction { action, mode } => {
+                    self.launch_workflow_action(terminal, action, mode, None)?;
+                }
+                AppEvent::RunCreateBranchWorkflow {
+                    base_branch,
+                    suffix,
+                } => {
+                    self.run_create_branch_workflow(terminal, &base_branch, &suffix)?;
+                }
+                AppEvent::WorkflowFinished(result) => {
+                    self.finish_workflow(terminal, result)?;
                 }
                 AppEvent::MergeBaseIntoCurrent => {
                     self.merge_base_into_current();
@@ -432,6 +463,12 @@ impl App<'_> {
                     Line::raw(msg).fg(self.ctx.color_theme.status_input_fg)
                 }
             }
+            StatusLine::Busy(msg) => Line::raw(format!(
+                "{} {msg}",
+                busy_spinner_frame(self.app_status.busy_frame)
+            ))
+            .add_modifier(Modifier::BOLD)
+            .fg(self.ctx.color_theme.status_info_fg),
             StatusLine::NotificationInfo(msg) => {
                 Line::raw(msg).fg(self.ctx.color_theme.status_info_fg)
             }
@@ -709,9 +746,10 @@ impl App<'_> {
                 );
             }
             PromptKind::CreateBranchSuffix { base_branch } => {
-                if let Err(err) = self.run_create_branch_workflow(&base_branch, value.as_str()) {
-                    self.error_notification(err);
-                }
+                self.ec.send(AppEvent::RunCreateBranchWorkflow {
+                    base_branch,
+                    suffix: value,
+                });
             }
             PromptKind::PullOtherRemoteRemote => {
                 let remote = value.trim().to_string();
@@ -732,13 +770,13 @@ impl App<'_> {
                     self.error_notification("Branch name cannot be empty".into());
                     return;
                 }
-                self.run_workflow_action(
-                    WorkflowAction::GraphPullOtherRemote {
+                self.ec.send(AppEvent::RunWorkflowAction {
+                    action: WorkflowAction::GraphPullOtherRemote {
                         remote,
                         branch: branch.to_string(),
                     },
-                    WorkflowExecutionMode::Silent,
-                );
+                    mode: WorkflowExecutionMode::Silent,
+                });
             }
             PromptKind::SwitchBranch => {
                 if let Err(err) = self.switch_branch(value.as_str()) {
@@ -765,19 +803,19 @@ impl App<'_> {
             Some('t') => self.open_status(),
             Some('a') => self.open_set_base_prompt(),
             Some('f') => self.open_set_branch_prefix_prompt(),
-            Some('p') => self.run_workflow_action(
-                WorkflowAction::GraphPushCurrent,
-                WorkflowExecutionMode::Silent,
-            ),
-            Some('l') => self.run_workflow_action(
-                WorkflowAction::GraphPullCurrent,
-                WorkflowExecutionMode::Silent,
-            ),
+            Some('p') => self.ec.send(AppEvent::RunWorkflowAction {
+                action: WorkflowAction::GraphPushCurrent,
+                mode: WorkflowExecutionMode::Silent,
+            }),
+            Some('l') => self.ec.send(AppEvent::RunWorkflowAction {
+                action: WorkflowAction::GraphPullCurrent,
+                mode: WorkflowExecutionMode::Silent,
+            }),
             Some('L') => self.open_pull_other_remote_prompt(),
-            Some('r') => self.run_workflow_action(
-                WorkflowAction::GraphCreatePullRequest,
-                WorkflowExecutionMode::Suspend,
-            ),
+            Some('r') => self.ec.send(AppEvent::RunWorkflowAction {
+                action: WorkflowAction::GraphCreatePullRequest,
+                mode: WorkflowExecutionMode::Suspend,
+            }),
             Some('m') => self.merge_base_into_current(),
             Some('i') => self.install_hook(),
             Some('R') => self.view.refresh(),
@@ -880,28 +918,34 @@ impl App<'_> {
 
     fn run_create_branch_workflow(
         &mut self,
+        terminal: &mut DefaultTerminal,
         base_branch: &str,
         suffix: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), std::io::Error> {
         let suffix = suffix.trim().trim_matches('/');
         if suffix.is_empty() {
-            return Err("Branch suffix cannot be empty".into());
+            self.error_notification("Branch suffix cannot be empty".into());
+            return Ok(());
         }
 
-        self.ensure_base_worktree(base_branch)?;
+        if let Err(err) = self.ensure_base_worktree(base_branch) {
+            self.error_notification(err);
+            return Ok(());
+        }
 
         let branch_name = format!("{}/{}", self.current_branch_prefix(), suffix);
-        self.perform_workflow_action(
+        self.launch_workflow_action(
+            terminal,
             WorkflowAction::GraphCreateBranch {
                 base_branch: base_branch.to_string(),
                 branch_name: branch_name.clone(),
             },
             WorkflowExecutionMode::Silent,
+            Some(WorkflowPostAction::SaveBranchOrigin {
+                branch_name,
+                base_branch: base_branch.to_string(),
+            }),
         )?;
-
-        let mut state = self.load_repo_state().unwrap_or_default();
-        state.set_branch_origin(&branch_name, base_branch);
-        self.save_repo_state(&state)?;
         Ok(())
     }
 
@@ -1009,61 +1053,117 @@ impl App<'_> {
         Ok(())
     }
 
-    fn run_workflow_action(&mut self, action: WorkflowAction, mode: WorkflowExecutionMode) {
-        match self.perform_workflow_action(action, mode) {
-            Ok(()) => {}
-            Err(err) => self.error_notification(err),
-        }
-    }
-
-    fn perform_workflow_action(
+    fn launch_workflow_action(
         &mut self,
+        terminal: &mut DefaultTerminal,
         action: WorkflowAction,
         mode: WorkflowExecutionMode,
-    ) -> Result<(), String> {
-        let result = (|| -> Result<Option<String>, String> {
-            let repo_root = git::get_repo_root(Path::new("."))
-                .ok_or_else(|| "Failed to resolve repository root".to_string())?;
-            let current_branch = git::get_current_branch(Path::new("."));
-            let selected_paths = match &action {
-                WorkflowAction::StatusCommit { paths }
-                | WorkflowAction::StatusDiscard { paths } => paths.clone(),
-                _ => Vec::new(),
-            };
-            let base_branch = current_branch.as_deref().and_then(|branch| {
-                self.load_repo_state()
-                    .ok()
-                    .and_then(|state| state.get_branch_origin(branch).map(str::to_string))
-            });
-            let context = WorkflowPromptContext::gather(
-                &repo_root,
-                self.git_helper_config(),
-                selected_paths,
-                self.selected_commit_hash()
-                    .map(|hash| hash.as_str().to_string()),
-                base_branch,
-            )?;
-            execute_workflow_action(self.git_helper_config(), &action, &context, mode)
-        })();
+        post_action: Option<WorkflowPostAction>,
+    ) -> Result<(), std::io::Error> {
+        if self.running_workflow.is_some() {
+            self.warn_notification("A workflow action is already running".into());
+            return Ok(());
+        }
+
+        let repo_root = match git::get_repo_root(Path::new(".")) {
+            Some(path) => path,
+            None => {
+                self.error_notification("Failed to resolve repository root".into());
+                return Ok(());
+            }
+        };
+        let current_branch = git::get_current_branch(Path::new("."));
+        let selected_paths = match &action {
+            WorkflowAction::StatusCommit { paths } | WorkflowAction::StatusDiscard { paths } => {
+                paths.clone()
+            }
+            _ => Vec::new(),
+        };
+        let base_branch = current_branch.as_deref().and_then(|branch| {
+            self.load_repo_state()
+                .ok()
+                .and_then(|state| state.get_branch_origin(branch).map(str::to_string))
+        });
+        let context = match WorkflowPromptContext::gather(
+            &repo_root,
+            self.git_helper_config(),
+            selected_paths,
+            self.selected_commit_hash()
+                .map(|hash| hash.as_str().to_string()),
+            base_branch,
+        ) {
+            Ok(context) => context,
+            Err(err) => {
+                self.error_notification(err);
+                return Ok(());
+            }
+        };
+        let git_helper = self.git_helper_config().clone();
+        let should_refresh = git_helper.workflow.auto_refresh_after_workflow_action;
+        let resume_terminal = mode == WorkflowExecutionMode::Suspend;
+        let busy_message = workflow_busy_message(&action);
+        self.busy_notification(busy_message);
+        self.app_status.busy_frame = 0;
+        terminal.draw(|f| self.render(f))?;
+        if resume_terminal {
+            self.ec.suspend();
+        }
+
+        let tx = self.ec.sender();
+        thread::spawn(move || {
+            let result = execute_workflow_action(&git_helper, &action, &context, mode);
+            tx.send(AppEvent::WorkflowFinished(result));
+        });
+
+        self.running_workflow = Some(RunningWorkflow {
+            should_refresh,
+            resume_terminal,
+            post_action,
+        });
+        Ok(())
+    }
+
+    fn finish_workflow(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        result: Result<Option<String>, String>,
+    ) -> Result<(), std::io::Error> {
+        let Some(running) = self.running_workflow.take() else {
+            return Ok(());
+        };
+
+        if running.resume_terminal {
+            self.ec.resume();
+            terminal.clear()?;
+        }
 
         match result {
             Ok(output) => {
+                if let Some(WorkflowPostAction::SaveBranchOrigin {
+                    branch_name,
+                    base_branch,
+                }) = running.post_action
+                {
+                    let mut state = self.load_repo_state().unwrap_or_default();
+                    state.set_branch_origin(&branch_name, &base_branch);
+                    if let Err(err) = self.save_repo_state(&state) {
+                        self.error_notification(err);
+                        return Ok(());
+                    }
+                }
+
                 if let Some(output) = output.filter(|s| !s.is_empty()) {
                     self.success_notification(output);
                 } else {
                     self.success_notification("Workflow action completed".into());
                 }
-                if self
-                    .git_helper_config()
-                    .workflow
-                    .auto_refresh_after_workflow_action
-                {
+                if running.should_refresh {
                     self.view.refresh();
                 }
-                Ok(())
             }
-            Err(err) => Err(err),
+            Err(err) => self.error_notification(err),
         }
+        Ok(())
     }
 
     fn update_state(&mut self, view_area: Rect) {
@@ -1383,6 +1483,7 @@ impl App<'_> {
 
     fn clear_status_line(&mut self) {
         self.app_status.status_line = StatusLine::None;
+        self.app_status.busy_frame = 0;
     }
 
     fn update_status_input(
@@ -1398,6 +1499,11 @@ impl App<'_> {
         self.app_status.status_line = StatusLine::NotificationInfo(msg);
     }
 
+    fn busy_notification(&mut self, msg: String) {
+        self.app_status.status_line = StatusLine::Busy(msg);
+        self.app_status.busy_frame = 0;
+    }
+
     fn success_notification(&mut self, msg: String) {
         self.app_status.status_line = StatusLine::NotificationSuccess(msg);
     }
@@ -1408,6 +1514,12 @@ impl App<'_> {
 
     fn error_notification(&mut self, msg: String) {
         self.app_status.status_line = StatusLine::NotificationError(msg);
+    }
+
+    fn advance_busy_frame(&mut self) {
+        if matches!(self.app_status.status_line, StatusLine::Busy(_)) {
+            self.app_status.busy_frame = self.app_status.busy_frame.wrapping_add(1);
+        }
     }
 
     fn copy_to_clipboard(&self, name: String, value: String) {
@@ -1532,6 +1644,43 @@ fn build_external_command_parameters<'a>(
     })
 }
 
+fn workflow_busy_message(action: &WorkflowAction) -> String {
+    match action {
+        WorkflowAction::StatusCommit { paths } => {
+            format!(
+                "Working: Codex is committing {} selected path(s)...",
+                paths.len()
+            )
+        }
+        WorkflowAction::StatusDiscard { paths } => {
+            format!(
+                "Working: Codex is discarding {} selected path(s)...",
+                paths.len()
+            )
+        }
+        WorkflowAction::GraphPushCurrent => {
+            "Working: Codex is pushing the current branch...".into()
+        }
+        WorkflowAction::GraphPullCurrent => {
+            "Working: Codex is pulling the current branch...".into()
+        }
+        WorkflowAction::GraphPullOtherRemote { remote, branch } => {
+            format!("Working: Codex is pulling {remote}/{branch}...")
+        }
+        WorkflowAction::GraphCreateBranch { branch_name, .. } => {
+            format!("Working: Codex is creating branch {branch_name}...")
+        }
+        WorkflowAction::GraphCreatePullRequest => {
+            "Working: Codex is creating a pull request...".into()
+        }
+    }
+}
+
+fn busy_spinner_frame(frame: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    FRAMES[frame % FRAMES.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -1556,5 +1705,22 @@ mod tests {
         let dummy_key_event = KeyEvent::from(KeyCode::Enter); // KeyEvent is not used in the logic
         let actual = process_numeric_prefix(numeric_prefix, user_event, dummy_key_event);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn workflow_busy_message_describes_commit_work() {
+        let actual = workflow_busy_message(&WorkflowAction::StatusCommit {
+            paths: vec!["src/app.rs".into(), "src/view/status.rs".into()],
+        });
+        assert_eq!(actual, "Working: Codex is committing 2 selected path(s)...");
+    }
+
+    #[test]
+    fn workflow_busy_message_describes_remote_pull() {
+        let actual = workflow_busy_message(&WorkflowAction::GraphPullOtherRemote {
+            remote: "origin".into(),
+            branch: "main".into(),
+        });
+        assert_eq!(actual, "Working: Codex is pulling origin/main...");
     }
 }

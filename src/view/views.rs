@@ -13,6 +13,7 @@ use crate::{
     },
     widget::commit_list::CommitListState,
 };
+use std::collections::BTreeSet;
 
 #[derive(Debug, Default)]
 pub enum View<'a> {
@@ -219,4 +220,6 @@ pub struct RefsRefreshViewContext {
 #[derive(Debug, Clone)]
 pub struct StatusRefreshViewContext {
     pub selected: usize,
+    pub expanded_dirs: BTreeSet<String>,
+    pub selected_paths: BTreeSet<String>,
 }

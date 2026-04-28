@@ -148,8 +148,9 @@ pub fn build_workflow_prompt(action: &WorkflowAction, context: &WorkflowPromptCo
              - Stage only the selected paths.\n\
              - Write an informative git commit message.\n\
              - Refuse if the current branch is protected.\n\
-             - If the git-dummy index is missing and required, create or update it before finishing.\n\
-             - Append a commit log entry to the git-dummy index after a successful commit."
+             - Do not create, modify, or stage `{}` for this action.\n\
+             - Keep the resulting commit scoped to the selected paths only.",
+            context.git_dummy_index_path.display()
         ),
         WorkflowAction::StatusDiscard { .. } => format!(
             "Requested action: discard only the selected paths.\n\
@@ -201,6 +202,9 @@ pub fn build_workflow_prompt(action: &WorkflowAction, context: &WorkflowPromptCo
         "You are performing a git workflow action for lil-big-helper.\n\
          Execute the requested action directly in the repository. Do not describe what you would do.\n\
          Return concise terminal-safe output only.\n\
+         This invocation is non-interactive; do not wait for user confirmation.\n\
+         Do not use skills, plans, or progress updates.\n\
+         Prefer the minimum number of shell commands needed to complete the action.\n\
          Refuse with a clear error if the requested action is unsafe.\n\
          \n\
          Repository: {}\n\
@@ -270,6 +274,7 @@ mod tests {
             &sample_context(),
         );
         assert!(prompt.contains("commit only the selected paths"));
+        assert!(prompt.contains("This invocation is non-interactive"));
         assert!(prompt.contains("- src/app.rs"));
         assert!(prompt.contains("Missing at /repo/.git-dummy/index.mdc."));
     }

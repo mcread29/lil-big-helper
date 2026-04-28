@@ -14,10 +14,11 @@ use serde::{
 };
 
 use crate::view::RefreshViewContext;
-use crate::workflow::WorkflowAction;
+use crate::workflow::{WorkflowAction, WorkflowExecutionMode};
 
 #[derive(Debug)]
 pub enum AppEvent {
+    Tick,
     Key(KeyEvent),
     Resize(usize, usize),
     Quit,
@@ -39,7 +40,10 @@ pub enum AppEvent {
     SelectNewerCommit,
     SelectOlderCommit,
     SelectParentCommit,
-    CopyToClipboard { name: String, value: String },
+    CopyToClipboard {
+        name: String,
+        value: String,
+    },
     Refresh(RefreshViewContext),
     ClearStatusLine,
     UpdateStatusInput(String, Option<u16>, Option<String>),
@@ -47,7 +51,15 @@ pub enum AppEvent {
     NotifySuccess(String),
     NotifyWarn(String),
     NotifyError(String),
-    RunWorkflowAction(WorkflowAction),
+    RunWorkflowAction {
+        action: WorkflowAction,
+        mode: WorkflowExecutionMode,
+    },
+    RunCreateBranchWorkflow {
+        base_branch: String,
+        suffix: String,
+    },
+    WorkflowFinished(Result<Option<String>, String>),
     MergeBaseIntoCurrent,
     InstallHook,
 }
@@ -133,9 +145,7 @@ impl EventController {
                         panic!("Failed to read event: {e}");
                     }
                 },
-                Ok(false) => {
-                    continue;
-                }
+                Ok(false) => tx.send(AppEvent::Tick),
                 Err(e) => {
                     panic!("Failed to poll event: {e}");
                 }

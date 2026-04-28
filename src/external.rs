@@ -4,7 +4,8 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arboard::Clipboard;
@@ -21,6 +22,8 @@ const USER_COMMAND_REMOTE_BRANCHES_MARKER: &str = "{{remote_branches}}";
 const USER_COMMAND_TAGS_MARKER: &str = "{{tags}}";
 const USER_COMMAND_AREA_WIDTH_MARKER: &str = "{{area_width}}";
 const USER_COMMAND_AREA_HEIGHT_MARKER: &str = "{{area_height}}";
+const CODEX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
+const CODEX_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 thread_local! {
     static CLIPBOARD: RefCell<Option<Clipboard>> = const { RefCell::new(None) };
@@ -186,9 +189,16 @@ pub(crate) fn run_codex_exec_capture(
 ) -> Result<String, String> {
     ensure_codex_authenticated()?;
     let output_path = codex_output_path("workflow");
-    let output = codex_exec_command(codex_command, repo_path, Some(&output_path), prompt)?
-        .output()
-        .map_err(|e| format!("Failed to run codex: {e}"))?;
+    let output = run_command_capture_with_timeout(
+        codex_exec_command(
+            codex_command,
+            repo_path,
+            Some(&output_path),
+            prompt,
+            CodexExecMode::Capture,
+        )?,
+        CODEX_CAPTURE_TIMEOUT,
+    )?;
     finish_codex_output(output, &output_path)
 }
 
@@ -198,9 +208,15 @@ pub(crate) fn run_codex_exec_status(
     prompt: &str,
 ) -> Result<(), String> {
     ensure_codex_authenticated()?;
-    let status = codex_exec_command(codex_command, repo_path, None, prompt)?
-        .status()
-        .map_err(|e| format!("Failed to run codex: {e}"))?;
+    let status = codex_exec_command(
+        codex_command,
+        repo_path,
+        None,
+        prompt,
+        CodexExecMode::Suspend,
+    )?
+    .status()
+    .map_err(|e| format!("Failed to run codex: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -224,17 +240,77 @@ fn codex_exec_command(
     repo_path: &Path,
     output_path: Option<&Path>,
     prompt: &str,
+    mode: CodexExecMode,
 ) -> Result<Command, String> {
     if codex_command.is_empty() {
         return Err("Codex command is not configured".into());
     }
     let mut cmd = Command::new(&codex_command[0]);
-    cmd.args(&codex_command[1..]).arg("-C").arg(repo_path);
+    cmd.args(augment_codex_args(&codex_command[1..], mode))
+        .arg("-C")
+        .arg(repo_path)
+        .stdin(Stdio::null());
     if let Some(output_path) = output_path {
         cmd.arg("-o").arg(output_path);
     }
     cmd.arg(prompt);
     Ok(cmd)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexExecMode {
+    Capture,
+    Suspend,
+}
+
+fn augment_codex_args(args: &[String], _mode: CodexExecMode) -> Vec<String> {
+    let mut augmented = args.to_vec();
+    if !has_codex_sandbox_flag(args) {
+        augmented.push("--sandbox".into());
+        augmented.push("danger-full-access".into());
+    }
+    augmented
+}
+
+fn has_codex_sandbox_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        || args
+        .windows(2)
+        .any(|window| matches!(window[0].as_str(), "-s" | "--sandbox"))
+}
+
+fn run_command_capture_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run codex: {e}"))?;
+    let start = Instant::now();
+
+    loop {
+        if child
+            .try_wait()
+            .map_err(|e| format!("Failed to poll codex process: {e}"))?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .map_err(|e| format!("Failed to collect codex output: {e}"));
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "codex timed out after {}s while running a workflow action; no final response was produced",
+                timeout.as_secs()
+            ));
+        }
+
+        thread::sleep(CODEX_WAIT_POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())));
+    }
 }
 
 fn finish_codex_output(output: std::process::Output, output_path: &Path) -> Result<String, String> {
@@ -278,4 +354,88 @@ fn replace_command_arg(s: &str, params: &ExternalCommandParameters) -> String {
         .replace(USER_COMMAND_TAGS_MARKER, tags)
         .replace(USER_COMMAND_AREA_WIDTH_MARKER, area_width)
         .replace(USER_COMMAND_AREA_HEIGHT_MARKER, area_height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        augment_codex_args, codex_exec_command, run_command_capture_with_timeout, CodexExecMode,
+    };
+    use std::{path::Path, process::Command, time::Duration};
+
+    #[test]
+    fn capture_mode_adds_danger_sandbox_when_missing() {
+        let args = augment_codex_args(
+            &["exec".into(), "--color".into(), "never".into()],
+            CodexExecMode::Capture,
+        );
+        assert_eq!(
+            args,
+            vec!["exec", "--color", "never", "--sandbox", "danger-full-access"]
+        );
+    }
+
+    #[test]
+    fn capture_mode_preserves_existing_sandbox_flags() {
+        let args = augment_codex_args(
+            &[
+                "exec".into(),
+                "--color".into(),
+                "never".into(),
+                "--sandbox".into(),
+                "workspace-write".into(),
+            ],
+            CodexExecMode::Capture,
+        );
+        assert_eq!(
+            args,
+            vec!["exec", "--color", "never", "--sandbox", "workspace-write"]
+        );
+    }
+
+    #[test]
+    fn suspend_mode_adds_danger_sandbox() {
+        let args = augment_codex_args(&["exec".into()], CodexExecMode::Suspend);
+        assert_eq!(args, vec!["exec", "--sandbox", "danger-full-access"]);
+    }
+
+    #[test]
+    fn codex_exec_command_adds_capture_flags_and_output_file() {
+        let cmd = codex_exec_command(
+            &["codex".into(), "exec".into()],
+            Path::new("/repo"),
+            Some(Path::new("/tmp/out.txt")),
+            "prompt",
+            CodexExecMode::Capture,
+        )
+        .unwrap();
+
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--sandbox",
+                "danger-full-access",
+                "-C",
+                "/repo",
+                "-o",
+                "/tmp/out.txt",
+                "prompt"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_command_capture_with_timeout_returns_clean_error() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 5");
+
+        let err = run_command_capture_with_timeout(cmd, Duration::from_millis(50)).unwrap_err();
+        assert!(err.contains("timed out"));
+        assert!(err.contains("no final response was produced"));
+    }
 }

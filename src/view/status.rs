@@ -20,7 +20,7 @@ use crate::{
     git::{self, StatusEntry},
     view::{ListRefreshViewContext, RefreshViewContext, StatusRefreshViewContext},
     widget::commit_list::CommitListState,
-    workflow::WorkflowAction,
+    workflow::{WorkflowAction, WorkflowExecutionMode},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +144,8 @@ impl<'a> StatusView<'a> {
     }
 
     pub fn reset_status_with(&mut self, ctx: StatusRefreshViewContext) {
+        self.ui.expanded_dirs = expanded_dirs_for_entries(&self.entries, &ctx.expanded_dirs);
+        self.ui.selected_paths = ctx.selected_paths;
         if self.entries.is_empty() {
             self.selected_row = 0;
             self.ui.file_offset = 0;
@@ -162,6 +164,8 @@ impl<'a> StatusView<'a> {
         let list_context = ListRefreshViewContext::from(self.as_list_state());
         let status_context = StatusRefreshViewContext {
             selected: self.selected_row,
+            expanded_dirs: self.ui.expanded_dirs.clone(),
+            selected_paths: self.ui.selected_paths.clone(),
         };
         self.tx.send(AppEvent::Refresh(RefreshViewContext::Status {
             list_context,
@@ -260,8 +264,7 @@ impl<'a> StatusView<'a> {
                 if matches!(
                     selection_state,
                     SelectionState::Partial | SelectionState::Full
-                )
-                {
+                ) {
                     line = line.add_modifier(Modifier::BOLD);
                 }
                 line
@@ -407,10 +410,10 @@ impl<'a> StatusView<'a> {
                 .send(AppEvent::NotifyError("No selected paths to discard".into()));
             return;
         }
-        self.tx
-            .send(AppEvent::RunWorkflowAction(WorkflowAction::StatusDiscard {
-                paths,
-            }));
+        self.tx.send(AppEvent::RunWorkflowAction {
+            action: WorkflowAction::StatusDiscard { paths },
+            mode: WorkflowExecutionMode::Silent,
+        });
     }
 
     fn commit_selected(&self) {
@@ -420,10 +423,10 @@ impl<'a> StatusView<'a> {
                 .send(AppEvent::NotifyError("No selected paths to commit".into()));
             return;
         }
-        self.tx
-            .send(AppEvent::RunWorkflowAction(WorkflowAction::StatusCommit {
-                paths,
-            }));
+        self.tx.send(AppEvent::RunWorkflowAction {
+            action: WorkflowAction::StatusCommit { paths },
+            mode: WorkflowExecutionMode::Silent,
+        });
     }
 
     fn has_selected_entries(&self) -> bool {
@@ -588,11 +591,7 @@ fn render_button(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .style(Style::default().fg(if focused {
-                        focus_border_fg
-                    } else {
-                        border_fg
-                    }))
+                    .style(Style::default().fg(if focused { focus_border_fg } else { border_fg }))
                     .padding(Padding::horizontal(1)),
             ),
         area,
@@ -824,6 +823,17 @@ fn collect_directory_paths(entries: &[StatusEntry]) -> BTreeSet<String> {
     paths
 }
 
+fn expanded_dirs_for_entries(
+    entries: &[StatusEntry],
+    expanded_dirs: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let available_dirs = collect_directory_paths(entries);
+    available_dirs
+        .into_iter()
+        .filter(|path| expanded_dirs.contains(path))
+        .collect()
+}
+
 fn selected_paths(selected_paths: &BTreeSet<String>) -> Vec<String> {
     selected_paths.iter().cloned().collect()
 }
@@ -843,8 +853,8 @@ fn style_diff_line(line: &str, ctx: &AppContext) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_focus, row_entry_paths, selected_paths, selection_state_for_row, FocusArea,
-        SelectionState, TreeRow,
+        expanded_dirs_for_entries, next_focus, row_entry_paths, selected_paths,
+        selection_state_for_row, FocusArea, SelectionState, TreeRow,
     };
     use crate::git::StatusEntry;
     use std::collections::BTreeSet;
@@ -910,5 +920,71 @@ mod tests {
             selected_paths(&selected),
             vec!["src/view/status.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn expanded_dirs_retain_only_currently_available_expanded_paths() {
+        let entries = vec![
+            StatusEntry {
+                path: "src/app.rs".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+            StatusEntry {
+                path: "src/view/status.rs".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+            StatusEntry {
+                path: "tests/status.rs".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+        ];
+        let expanded_before_refresh = BTreeSet::from([
+            "src/view".to_string(),
+            "src".to_string(),
+            "missing".to_string(),
+        ]);
+
+        let expanded = expanded_dirs_for_entries(&entries, &expanded_before_refresh);
+
+        assert_eq!(
+            expanded,
+            BTreeSet::from(["src".to_string(), "src/view".to_string()])
+        );
+    }
+
+    #[test]
+    fn expanded_dirs_drop_new_directories_until_user_expands_them_again() {
+        let entries = vec![
+            StatusEntry {
+                path: "src/view/status.rs".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+            StatusEntry {
+                path: "docs/guide.md".into(),
+                staged: false,
+                unstaged: true,
+                untracked: false,
+                deleted: false,
+            },
+        ];
+        let expanded_before_refresh = BTreeSet::from(["src".to_string(), "src/view".to_string()]);
+
+        let expanded = expanded_dirs_for_entries(&entries, &expanded_before_refresh);
+
+        assert!(!expanded.contains("docs"));
+        assert!(expanded.contains("src/view"));
+        assert!(expanded.contains("src"));
     }
 }
