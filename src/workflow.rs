@@ -146,7 +146,12 @@ pub fn build_workflow_prompt(action: &WorkflowAction, context: &WorkflowPromptCo
             "Requested action: commit only the selected paths.\n\
              Requirements:\n\
              - Stage only the selected paths.\n\
-             - Write an informative git commit message.\n\
+             - Inspect the selected diff before committing so the message reflects the actual code change.\n\
+             - Write a specific, descriptive git commit message in imperative mood.\n\
+             - The subject line must name the real behavior or code path that changed, not a vague action.\n\
+             - Avoid generic subjects such as `update`, `fix stuff`, `changes`, `misc`, or `wip`.\n\
+             - Prefer a subject in the form `<type>: <specific change>` when it fits, for example `fix: preserve selected status rows after refresh`.\n\
+             - Add a commit body when the change spans multiple files, has a non-obvious reason, or changes behavior in a way the subject alone does not capture.\n\
              - Refuse if the current branch is protected.\n\
              - Do not create, modify, or stage `{}` for this action.\n\
              - Keep the resulting commit scoped to the selected paths only.",
@@ -275,6 +280,13 @@ mod tests {
         );
         assert!(prompt.contains("commit only the selected paths"));
         assert!(prompt.contains("This invocation is non-interactive"));
+        assert!(prompt.contains("Inspect the selected diff before committing"));
+        assert!(prompt.contains(
+            "Avoid generic subjects such as `update`, `fix stuff`, `changes`, `misc`, or `wip`."
+        ));
+        assert!(prompt.contains(
+            "Add a commit body when the change spans multiple files"
+        ));
         assert!(prompt.contains("- src/app.rs"));
         assert!(prompt.contains("Missing at /repo/.git-dummy/index.mdc."));
     }
